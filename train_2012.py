@@ -8,6 +8,7 @@ import time
 import random
 import re
 import hashlib
+import datetime
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -778,7 +779,15 @@ def run_one_experiment(group, h, train_seq, val_seq, test_seq, edge_dim, device)
     os.makedirs("models/2012", exist_ok=True)
     os.makedirs("png/2012", exist_ok=True)
     kernel_tag = "-".join(str(k) for k in kernels)
-    run_tag = f"{group_tag}_seq{seq_len}_h{hidden}_k{kernel_tag}"
+    time_str = datetime.datetime.now().strftime("%m%d_%H%M")
+    run_tag = (
+        f"{group_tag}_seq{seq_len}_h{hidden}_hd{heads}_k{kernel_tag}"
+        f"_lr{lr}_clw{cl_loss_weight}"
+        f"_dp{drop_path}_de{dropedge_p}"
+        f"_v1{cl_view1_dropedge_p}_v2{cl_view2_dropedge_p}"
+        f"_acc{accum_steps}_t0{cosine_t0}_tm{cosine_tmult}_wu{warmup_epochs}"
+        f"_{time_str}"
+    )
     best_model_path = f"models/2012/best_model_{run_tag}.pth"
     print(f"Best model will be saved to: {best_model_path}", flush=True)
 

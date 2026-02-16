@@ -163,6 +163,149 @@ def evaluate_with_threshold(model, dataloader, device, class_names, threshold=0.
 
     return acc, f1, far, asa
 
+def _collect_attack_scores(model, dataloader, device, class_names):
+    model.eval()
+    normal_indices = _infer_normal_indices(class_names)
+    attack_indices = [i for i in range(len(class_names)) if i not in set(normal_indices)]
+
+    all_true_attack = []
+    all_scores = []
+    with torch.no_grad():
+        for batched_seq in dataloader:
+            if not batched_seq:
+                continue
+            batched_seq = [g.to(device) for g in batched_seq]
+            preds_seq = _forward_logits_seq(model, batched_seq)
+            logits = preds_seq[-1]
+            probs = torch.softmax(logits, dim=1)
+
+            labels = batched_seq[-1].edge_labels.detach().cpu().numpy().astype(np.int64)
+            true_attack = (~np.isin(labels, np.asarray(normal_indices, dtype=np.int64))).astype(np.int64)
+            if len(attack_indices) > 0:
+                score = probs[:, attack_indices].sum(dim=1).detach().cpu().numpy().astype(np.float64)
+            else:
+                score = probs[:, 0].detach().cpu().numpy().astype(np.float64)
+
+            all_true_attack.extend(true_attack.tolist())
+            all_scores.extend(score.tolist())
+
+    return np.asarray(all_true_attack, dtype=np.int64), np.asarray(all_scores, dtype=np.float64)
+
+def _attack_metrics_from_scores(y_true_attack, y_score, threshold):
+    y_true_attack = np.asarray(y_true_attack, dtype=np.int64)
+    y_score = np.asarray(y_score, dtype=np.float64)
+    y_pred_attack = (y_score >= float(threshold)).astype(np.int64)
+
+    tn, fp, fn, tp = confusion_matrix(y_true_attack, y_pred_attack, labels=[0, 1]).ravel()
+    far = fp / (fp + tn) if (fp + tn) > 0 else 0.0
+    asa = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = f1_score(y_true_attack, y_pred_attack, zero_division=0) if y_true_attack.size > 0 else 0.0
+    return float(f1), float(far), float(asa)
+
+def _attack_best_threshold(y_true_attack, y_score, max_far=0.01):
+    y_true_attack = np.asarray(y_true_attack, dtype=np.int64)
+    y_score = np.asarray(y_score, dtype=np.float64)
+    if y_true_attack.size == 0:
+        return 0.5, 0.0, 0.0, 0.0
+
+    try:
+        from sklearn.metrics import precision_recall_curve
+        _, _, thresholds = precision_recall_curve(y_true_attack, y_score)
+        candidates = thresholds if thresholds is not None and len(thresholds) > 0 else None
+    except Exception:
+        candidates = None
+
+    if candidates is None:
+        candidates = np.unique(np.quantile(y_score, np.linspace(0.0, 1.0, 101)))
+
+    best_th = 0.5
+    best_f1 = -1.0
+    best_far = 1.0
+    best_asa = -1.0
+    for th in np.asarray(candidates, dtype=np.float64):
+        f1, far, asa = _attack_metrics_from_scores(y_true_attack, y_score, float(th))
+        if far <= float(max_far):
+            if (asa > best_asa) or (asa == best_asa and f1 > best_f1):
+                best_th, best_f1, best_far, best_asa = float(th), float(f1), float(far), float(asa)
+
+    if best_asa < 0.0:
+        for th in np.asarray(candidates, dtype=np.float64):
+            f1, far, asa = _attack_metrics_from_scores(y_true_attack, y_score, float(th))
+            if (asa > best_asa) or (asa == best_asa and f1 > best_f1):
+                best_th, best_f1, best_far, best_asa = float(th), float(f1), float(far), float(asa)
+
+    return best_th, best_f1, best_far, best_asa
+
+def evaluate_comprehensive_with_threshold(model, dataloader, device, class_names, threshold):
+    model.eval()
+    all_labels = []
+    all_preds = []
+    all_probs = []
+
+    normal_indices = _infer_normal_indices(class_names)
+    attack_indices = [i for i in range(len(class_names)) if i not in set(normal_indices)]
+
+    with torch.no_grad():
+        for batched_seq in dataloader:
+            if not batched_seq:
+                continue
+            batched_seq = [g.to(device) for g in batched_seq]
+
+            preds_seq = _forward_logits_seq(model, batched_seq)
+            logits = preds_seq[-1]
+            probs = torch.softmax(logits, dim=1)
+            preds = torch.argmax(probs, dim=1)
+
+            if len(attack_indices) > 0:
+                attack_probs_sum = probs[:, attack_indices].sum(dim=1)
+                mask = attack_probs_sum > threshold
+                if mask.any():
+                    sub_probs = probs[mask][:, attack_indices]
+                    sub_argmax = torch.argmax(sub_probs, dim=1)
+                    new_preds = torch.tensor(attack_indices, device=device)[sub_argmax]
+                    preds = preds.clone()
+                    preds[mask] = new_preds
+
+            all_labels.extend(batched_seq[-1].edge_labels.detach().cpu().numpy())
+            all_preds.extend(preds.detach().cpu().numpy())
+            all_probs.extend(probs.detach().cpu().numpy())
+
+    if len(all_labels) == 0:
+        return 0, 0, 0, 0, 0, 0.5, 0, np.array([]), np.array([])
+
+    y_true = np.asarray(all_labels, dtype=np.int64)
+    y_pred = np.asarray(all_preds, dtype=np.int64)
+    y_probs = np.asarray(all_probs, dtype=np.float64)
+
+    acc = float((y_pred == y_true).mean())
+    prec = float(precision_score(y_true, y_pred, average='weighted', zero_division=0))
+    rec = float(recall_score(y_true, y_pred, average='weighted', zero_division=0))
+    f1 = float(f1_score(y_true, y_pred, average='weighted', zero_division=0))
+
+    is_true_normal = np.isin(y_true, np.asarray(normal_indices, dtype=np.int64))
+    is_pred_normal = np.isin(y_pred, np.asarray(normal_indices, dtype=np.int64))
+    fp = np.logical_and(is_true_normal, ~is_pred_normal).sum()
+    tn = np.logical_and(is_true_normal, is_pred_normal).sum()
+    far = float(fp / (fp + tn)) if (fp + tn) > 0 else 0.0
+
+    attack_mask = ~is_true_normal
+    asa = float((y_pred[attack_mask] == y_true[attack_mask]).mean()) if attack_mask.any() else 0.0
+
+    present_labels = np.unique(y_true)
+    try:
+        if y_probs.ndim != 2 or y_probs.shape[0] != y_true.shape[0]:
+            auc = 0.5
+        elif len(present_labels) < 2:
+            auc = 0.5
+        elif len(class_names) == 2 and y_probs.shape[1] >= 2:
+            auc = float(roc_auc_score(y_true, y_probs[:, 1]))
+        else:
+            auc = _auc_ovr_macro(y_true, y_probs, present_labels)
+    except Exception:
+        auc = 0.5
+
+    return acc, prec, rec, f1, far, auc, asa, y_true, y_pred
+
 # 在创建数据集和数据加载器之前，添加以下重平衡函数
 def rebalance_graph_dataset(graph_data_seq, attack_label=0, normal_sample_ratio=0.1, random_seed1=42):
     """

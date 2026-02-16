@@ -60,6 +60,11 @@ GROUPS = {
     "E15": {"MAX_CL_EDGES": "8448"},
     "E16": {"MAX_CL_EDGES": "8960"},
     "E17": {"MAX_CL_EDGES": "8192"},
+
+    "F0": {"CL_LOSS_WEIGHT": 0.0},
+    "F1": {"CL_VIEW1_DROPEDGE_P": 0.1, "CL_VIEW2_DROPEDGE_P": 0.2},
+    "F2": {"CL_VIEW1_DROPEDGE_P": 0.2, "CL_VIEW2_DROPEDGE_P": 0.4},
+    "F3": {"CL_VIEW1_DROPEDGE_P": 0.3, "CL_VIEW2_DROPEDGE_P": 0.5},
     
 
 }

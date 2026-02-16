@@ -22,7 +22,14 @@ from model import MILAN
 # === 导入核心模型与评估函数 ===
 # 确保 analys.py 和 model_Final.py 在同一目录下
 try:
-    from analys import FocalLoss, evaluate_comprehensive, evaluate_with_threshold
+    from analys import (
+        _attack_best_threshold,
+        _collect_attack_scores,
+        FocalLoss,
+        evaluate_comprehensive,
+        evaluate_comprehensive_with_threshold,
+        evaluate_with_threshold,
+    )
     from model_final import ROEN_Final
 except ImportError:
     print("❌ Error: analys.py or model_Final.py not found. Please check your directory.")
@@ -31,167 +38,27 @@ except ImportError:
 # ==========================================
 # 辅助函数
 # ==========================================
+def _subnet_key(ip):
+    try:
+        parts = str(ip).split(".")
+        if len(parts) < 3:
+            return (0, 0, 0)
+        a = int(parts[0])
+        b = int(parts[1])
+        c = int(parts[2])
+        return (a, b, c)
+    except Exception:
+        return (0, 0, 0)
+
 def get_ip_id_hash(ip_str):
     hash_obj = hashlib.md5(str(ip_str).encode())
     return int(hash_obj.hexdigest()[:15], 16)
 
 UNK_SUBNET_ID = 0
 
-def _infer_normal_indices(class_names):
-    normal_indices = []
-    for idx, name in enumerate(class_names):
-        name_lower = str(name).lower()
-        if ("benign" in name_lower) or ("normal" in name_lower) or ("non" in name_lower):
-            normal_indices.append(idx)
-    return normal_indices
-
-def _collect_attack_scores(model, dataloader, device, class_names):
-    model.eval()
-    normal_indices = _infer_normal_indices(class_names)
-    attack_indices = [i for i in range(len(class_names)) if i not in set(normal_indices)]
-
-    all_true_attack = []
-    all_scores = []
-    with torch.no_grad():
-        for batched_seq in dataloader:
-            if not batched_seq:
-                continue
-            batched_seq = [g.to(device) for g in batched_seq]
-            out = model(graphs=batched_seq)
-            preds_seq = out[0] if isinstance(out, tuple) else out
-            logits = preds_seq[-1]
-            probs = torch.softmax(logits, dim=1)
-
-            labels = batched_seq[-1].edge_labels.detach().cpu().numpy().astype(np.int64)
-            true_attack = (~np.isin(labels, np.asarray(normal_indices, dtype=np.int64))).astype(np.int64)
-            if len(attack_indices) > 0:
-                score = probs[:, attack_indices].sum(dim=1).detach().cpu().numpy().astype(np.float64)
-            else:
-                score = probs[:, 0].detach().cpu().numpy().astype(np.float64)
-
-            all_true_attack.extend(true_attack.tolist())
-            all_scores.extend(score.tolist())
-
-    return np.asarray(all_true_attack, dtype=np.int64), np.asarray(all_scores, dtype=np.float64)
-
-def _attack_metrics_from_scores(y_true_attack, y_score, threshold):
-    y_true_attack = np.asarray(y_true_attack, dtype=np.int64)
-    y_score = np.asarray(y_score, dtype=np.float64)
-    y_pred_attack = (y_score >= float(threshold)).astype(np.int64)
-
-    tn, fp, fn, tp = confusion_matrix(y_true_attack, y_pred_attack, labels=[0, 1]).ravel()
-    far = fp / (fp + tn) if (fp + tn) > 0 else 0.0
-    asa = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1 = f1_score(y_true_attack, y_pred_attack, zero_division=0) if y_true_attack.size > 0 else 0.0
-    return float(f1), float(far), float(asa)
-
-def _attack_best_threshold(y_true_attack, y_score, max_far=0.03):
-    y_true_attack = np.asarray(y_true_attack, dtype=np.int64)
-    y_score = np.asarray(y_score, dtype=np.float64)
-    if y_true_attack.size == 0:
-        return 0.5, 0.0, 0.0, 0.0
-
-    try:
-        from sklearn.metrics import precision_recall_curve
-        _, _, thresholds = precision_recall_curve(y_true_attack, y_score)
-        candidates = thresholds if thresholds is not None and len(thresholds) > 0 else None
-    except Exception:
-        candidates = None
-
-    if candidates is None:
-        candidates = np.unique(np.quantile(y_score, np.linspace(0.0, 1.0, 101)))
-
-    best_th = 0.5
-    best_f1 = -1.0
-    best_far = 1.0
-    best_asa = -1.0
-    for th in np.asarray(candidates, dtype=np.float64):
-        f1, far, asa = _attack_metrics_from_scores(y_true_attack, y_score, float(th))
-        if far <= float(max_far):
-            if (asa > best_asa) or (asa == best_asa and f1 > best_f1):
-                best_th, best_f1, best_far, best_asa = float(th), float(f1), float(far), float(asa)
-
-    if best_asa < 0.0:
-        for th in np.asarray(candidates, dtype=np.float64):
-            f1, far, asa = _attack_metrics_from_scores(y_true_attack, y_score, float(th))
-            if (asa > best_asa) or (asa == best_asa and f1 > best_f1):
-                best_th, best_f1, best_far, best_asa = float(th), float(f1), float(far), float(asa)
-
-    return best_th, best_f1, best_far, best_asa
-
-def evaluate_comprehensive_with_threshold(model, dataloader, device, class_names, threshold):
-    model.eval()
-    all_labels = []
-    all_preds = []
-    all_probs = []
-
-    normal_indices = []
-    for idx, name in enumerate(class_names):
-        name_lower = str(name).lower()
-        if ('benign' in name_lower) or ('normal' in name_lower) or ('non' in name_lower):
-            normal_indices.append(idx)
-
-    attack_indices = [i for i in range(len(class_names)) if i not in set(normal_indices)]
-
-    with torch.no_grad():
-        for batched_seq in dataloader:
-            if not batched_seq: continue
-            batched_seq = [g.to(device) for g in batched_seq]
-
-            try:
-                out = model(graphs=batched_seq, seq_len=len(batched_seq))
-            except TypeError:
-                out = model(graphs=batched_seq)
-            
-            preds_seq = out[0] if isinstance(out, tuple) else out
-            logits = preds_seq[-1]
-            probs = torch.softmax(logits, dim=1)
-            preds = torch.argmax(probs, dim=1)
-
-            if len(attack_indices) > 0:
-                attack_probs_sum = probs[:, attack_indices].sum(dim=1)
-                mask = attack_probs_sum > threshold
-                if mask.any():
-                    sub_probs = probs[mask][:, attack_indices]
-                    sub_argmax = torch.argmax(sub_probs, dim=1)
-                    new_preds = torch.tensor(attack_indices, device=device)[sub_argmax]
-                    preds = preds.clone()
-                    preds[mask] = new_preds
-
-            all_labels.extend(batched_seq[-1].edge_labels.detach().cpu().numpy())
-            all_preds.extend(preds.detach().cpu().numpy())
-            all_probs.extend(probs.detach().cpu().numpy())
-
-    if len(all_labels) == 0:
-        return 0, 0, 0, 0, 0, 0.5, 0, np.array([]), np.array([])
-
-    y_true = np.array(all_labels)
-    y_pred = np.array(all_preds)
-    y_probs = np.array(all_probs)
-
-    acc = (y_pred == y_true).mean()
-    prec = precision_score(y_true, y_pred, average='weighted', zero_division=0)
-    rec = recall_score(y_true, y_pred, average='weighted', zero_division=0)
-    f1 = f1_score(y_true, y_pred, average='weighted', zero_division=0)
-
-    is_true_normal = np.isin(y_true, normal_indices)
-    is_pred_normal = np.isin(y_pred, normal_indices)
-    fp = np.logical_and(is_true_normal, ~is_pred_normal).sum()
-    tn = np.logical_and(is_true_normal, is_pred_normal).sum()
-    far = fp / (fp + tn) if (fp + tn) > 0 else 0.0
-
-    attack_mask = ~is_true_normal
-    asa = (y_pred[attack_mask] == y_true[attack_mask]).mean() if attack_mask.any() else 0.0
-
-    try:
-        if len(class_names) == 2:
-            auc = roc_auc_score(y_true, y_probs[:, 1])
-        else:
-            auc = roc_auc_score(y_true, y_probs, multi_class='ovr', average='macro')
-    except Exception:
-        auc = 0.5
-
-    return acc, prec, rec, f1, far, auc, asa, y_true, y_pred
+def get_subnet_id_safe(ip_str, subnet_map):
+    key = _subnet_key(ip_str)
+    return subnet_map.get(key, UNK_SUBNET_ID)
 
 # ==========================================
 # 1. 稀疏图构建函数 (修复版)
@@ -271,8 +138,18 @@ def create_graph_data_inductive(time_slice, subnet_map, label_encoder, time_wind
         dim=-1,
     ).float()
 
-    # --- Subnet ID (全0占位，避免越界) ---
-    subnet_id = torch.zeros(n_nodes, dtype=torch.long)
+    subnet_id = None
+    if subnet_map is not None:
+        subnet_ids_for_node = {}
+        unique_ips = pd.concat([time_slice['Src IP'], time_slice['Dst IP']]).unique()
+        for ip_str in unique_ips:
+            hid = get_ip_id_hash(ip_str)
+            subnet_ids_for_node[hid] = get_subnet_id_safe(ip_str, subnet_map)
+
+        subnet_id = torch.tensor(
+            [subnet_ids_for_node.get(int(h), UNK_SUBNET_ID) for h in unique_nodes],
+            dtype=torch.long,
+        )
 
     # --- 边特征 ---
     drop_cols = ['Src IP', 'Dst IP', 'Flow ID', 'Label', 'Timestamp', 'Src Port', 'Dst Port', 
@@ -283,7 +160,8 @@ def create_graph_data_inductive(time_slice, subnet_map, label_encoder, time_wind
     if edge_index.size(1) > 0:
         edge_labels = torch.tensor(labels, dtype=torch.long)
         data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr, edge_labels=edge_labels, n_id=n_id)
-        data.subnet_id = subnet_id
+        if subnet_id is not None:
+            data.subnet_id = subnet_id
         return data
     else:
         return None
@@ -564,7 +442,19 @@ def run_one_experiment(
         try:
             ckpt = torch.load(best_model_path, map_location=device)
             if isinstance(ckpt, dict) and "state_dict" in ckpt:
-                model.load_state_dict(ckpt["state_dict"], strict=True)
+                ckpt_seq_len = ckpt.get("seq_len", None)
+                ckpt_num_classes = ckpt.get("num_classes", None)
+                ckpt_edge_dim = ckpt.get("edge_dim", None)
+
+                if ckpt_seq_len != seq_len or ckpt_num_classes != len(class_names) or ckpt_edge_dim != edge_dim:
+                    print(
+                        f"[{group_tag}] ⚠️ Checkpoint config mismatch, skip loading. "
+                        f"(ckpt seq_len={ckpt_seq_len}, num_classes={ckpt_num_classes}, edge_dim={ckpt_edge_dim}) "
+                        f"vs (current seq_len={seq_len}, num_classes={len(class_names)}, edge_dim={edge_dim})",
+                        flush=True,
+                    )
+                else:
+                    model.load_state_dict(ckpt["state_dict"], strict=True)
             else:
                 model.load_state_dict(ckpt, strict=True)
         except Exception as e:
@@ -771,9 +661,21 @@ def main():
     val_df[feat_cols] = scaler.transform(val_df[feat_cols])
     test_df[feat_cols] = scaler.transform(test_df[feat_cols])
 
-    # --- 5. 构建 Graphs ---
+    print("Building Subnet Map (From Train Set Only)...")
+    train_df['Src IP'] = train_df['Src IP'].astype(str).str.strip()
+    train_df['Dst IP'] = train_df['Dst IP'].astype(str).str.strip()
+
+    train_ips = pd.concat([train_df['Src IP'], train_df['Dst IP']]).unique()
+    subnet_to_idx = {'<UNK>': UNK_SUBNET_ID}
+
+    for ip in train_ips:
+        key = _subnet_key(ip)
+        if key not in subnet_to_idx:
+            subnet_to_idx[key] = len(subnet_to_idx)
+
+    print(f"Train Subnets: {len(subnet_to_idx)}", flush=True)
+
     print("🏗️ Constructing Train Graphs...")
-    subnet_to_idx = {'<UNK>': 0} 
     
     train_seqs = []
     for name, group in tqdm(train_df.groupby('time_idx', sort=True)):
