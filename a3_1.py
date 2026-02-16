@@ -1,0 +1,843 @@
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import hashlib
+import os
+import time
+import glob
+from tqdm import tqdm
+from hparams_a3 import resolve_hparams
+from torch.cuda.amp import autocast, GradScaler
+from torch_geometric.loader import DataLoader
+from torch_geometric.data import Batch, Data
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.metrics import recall_score, f1_score, roc_auc_score, precision_score, confusion_matrix
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from model import MILAN
+
+# === 导入核心模型与评估函数 ===
+# 确保 analys.py 和 model_Final.py 在同一目录下
+try:
+    from analys import FocalLoss, evaluate_comprehensive, evaluate_with_threshold
+    from model_final import ROEN_Final
+except ImportError:
+    print("❌ Error: analys.py or model_Final.py not found. Please check your directory.")
+    exit()
+
+# ==========================================
+# 辅助函数
+# ==========================================
+def get_ip_id_hash(ip_str):
+    hash_obj = hashlib.md5(str(ip_str).encode())
+    return int(hash_obj.hexdigest()[:15], 16)
+
+UNK_SUBNET_ID = 0
+
+def _infer_normal_indices(class_names):
+    normal_indices = []
+    for idx, name in enumerate(class_names):
+        name_lower = str(name).lower()
+        if ("benign" in name_lower) or ("normal" in name_lower) or ("non" in name_lower):
+            normal_indices.append(idx)
+    return normal_indices
+
+def _collect_attack_scores(model, dataloader, device, class_names):
+    model.eval()
+    normal_indices = _infer_normal_indices(class_names)
+    attack_indices = [i for i in range(len(class_names)) if i not in set(normal_indices)]
+
+    all_true_attack = []
+    all_scores = []
+    with torch.no_grad():
+        for batched_seq in dataloader:
+            if not batched_seq:
+                continue
+            batched_seq = [g.to(device) for g in batched_seq]
+            out = model(graphs=batched_seq)
+            preds_seq = out[0] if isinstance(out, tuple) else out
+            logits = preds_seq[-1]
+            probs = torch.softmax(logits, dim=1)
+
+            labels = batched_seq[-1].edge_labels.detach().cpu().numpy().astype(np.int64)
+            true_attack = (~np.isin(labels, np.asarray(normal_indices, dtype=np.int64))).astype(np.int64)
+            if len(attack_indices) > 0:
+                score = probs[:, attack_indices].sum(dim=1).detach().cpu().numpy().astype(np.float64)
+            else:
+                score = probs[:, 0].detach().cpu().numpy().astype(np.float64)
+
+            all_true_attack.extend(true_attack.tolist())
+            all_scores.extend(score.tolist())
+
+    return np.asarray(all_true_attack, dtype=np.int64), np.asarray(all_scores, dtype=np.float64)
+
+def _attack_metrics_from_scores(y_true_attack, y_score, threshold):
+    y_true_attack = np.asarray(y_true_attack, dtype=np.int64)
+    y_score = np.asarray(y_score, dtype=np.float64)
+    y_pred_attack = (y_score >= float(threshold)).astype(np.int64)
+
+    tn, fp, fn, tp = confusion_matrix(y_true_attack, y_pred_attack, labels=[0, 1]).ravel()
+    far = fp / (fp + tn) if (fp + tn) > 0 else 0.0
+    asa = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = f1_score(y_true_attack, y_pred_attack, zero_division=0) if y_true_attack.size > 0 else 0.0
+    return float(f1), float(far), float(asa)
+
+def _attack_best_threshold(y_true_attack, y_score, max_far=0.03):
+    y_true_attack = np.asarray(y_true_attack, dtype=np.int64)
+    y_score = np.asarray(y_score, dtype=np.float64)
+    if y_true_attack.size == 0:
+        return 0.5, 0.0, 0.0, 0.0
+
+    try:
+        from sklearn.metrics import precision_recall_curve
+        _, _, thresholds = precision_recall_curve(y_true_attack, y_score)
+        candidates = thresholds if thresholds is not None and len(thresholds) > 0 else None
+    except Exception:
+        candidates = None
+
+    if candidates is None:
+        candidates = np.unique(np.quantile(y_score, np.linspace(0.0, 1.0, 101)))
+
+    best_th = 0.5
+    best_f1 = -1.0
+    best_far = 1.0
+    best_asa = -1.0
+    for th in np.asarray(candidates, dtype=np.float64):
+        f1, far, asa = _attack_metrics_from_scores(y_true_attack, y_score, float(th))
+        if far <= float(max_far):
+            if (asa > best_asa) or (asa == best_asa and f1 > best_f1):
+                best_th, best_f1, best_far, best_asa = float(th), float(f1), float(far), float(asa)
+
+    if best_asa < 0.0:
+        for th in np.asarray(candidates, dtype=np.float64):
+            f1, far, asa = _attack_metrics_from_scores(y_true_attack, y_score, float(th))
+            if (asa > best_asa) or (asa == best_asa and f1 > best_f1):
+                best_th, best_f1, best_far, best_asa = float(th), float(f1), float(far), float(asa)
+
+    return best_th, best_f1, best_far, best_asa
+
+def evaluate_comprehensive_with_threshold(model, dataloader, device, class_names, threshold):
+    model.eval()
+    all_labels = []
+    all_preds = []
+    all_probs = []
+
+    normal_indices = []
+    for idx, name in enumerate(class_names):
+        name_lower = str(name).lower()
+        if ('benign' in name_lower) or ('normal' in name_lower) or ('non' in name_lower):
+            normal_indices.append(idx)
+
+    attack_indices = [i for i in range(len(class_names)) if i not in set(normal_indices)]
+
+    with torch.no_grad():
+        for batched_seq in dataloader:
+            if not batched_seq: continue
+            batched_seq = [g.to(device) for g in batched_seq]
+
+            try:
+                out = model(graphs=batched_seq, seq_len=len(batched_seq))
+            except TypeError:
+                out = model(graphs=batched_seq)
+            
+            preds_seq = out[0] if isinstance(out, tuple) else out
+            logits = preds_seq[-1]
+            probs = torch.softmax(logits, dim=1)
+            preds = torch.argmax(probs, dim=1)
+
+            if len(attack_indices) > 0:
+                attack_probs_sum = probs[:, attack_indices].sum(dim=1)
+                mask = attack_probs_sum > threshold
+                if mask.any():
+                    sub_probs = probs[mask][:, attack_indices]
+                    sub_argmax = torch.argmax(sub_probs, dim=1)
+                    new_preds = torch.tensor(attack_indices, device=device)[sub_argmax]
+                    preds = preds.clone()
+                    preds[mask] = new_preds
+
+            all_labels.extend(batched_seq[-1].edge_labels.detach().cpu().numpy())
+            all_preds.extend(preds.detach().cpu().numpy())
+            all_probs.extend(probs.detach().cpu().numpy())
+
+    if len(all_labels) == 0:
+        return 0, 0, 0, 0, 0, 0.5, 0, np.array([]), np.array([])
+
+    y_true = np.array(all_labels)
+    y_pred = np.array(all_preds)
+    y_probs = np.array(all_probs)
+
+    acc = (y_pred == y_true).mean()
+    prec = precision_score(y_true, y_pred, average='weighted', zero_division=0)
+    rec = recall_score(y_true, y_pred, average='weighted', zero_division=0)
+    f1 = f1_score(y_true, y_pred, average='weighted', zero_division=0)
+
+    is_true_normal = np.isin(y_true, normal_indices)
+    is_pred_normal = np.isin(y_pred, normal_indices)
+    fp = np.logical_and(is_true_normal, ~is_pred_normal).sum()
+    tn = np.logical_and(is_true_normal, is_pred_normal).sum()
+    far = fp / (fp + tn) if (fp + tn) > 0 else 0.0
+
+    attack_mask = ~is_true_normal
+    asa = (y_pred[attack_mask] == y_true[attack_mask]).mean() if attack_mask.any() else 0.0
+
+    try:
+        if len(class_names) == 2:
+            auc = roc_auc_score(y_true, y_probs[:, 1])
+        else:
+            auc = roc_auc_score(y_true, y_probs, multi_class='ovr', average='macro')
+    except Exception:
+        auc = 0.5
+
+    return acc, prec, rec, f1, far, auc, asa, y_true, y_pred
+
+# ==========================================
+# 1. 稀疏图构建函数 (修复版)
+# ==========================================
+def create_graph_data_inductive(time_slice, subnet_map, label_encoder, time_window):
+    # 避免 SettingWithCopyWarning
+    time_slice = time_slice.copy()
+    
+    # 确保 IP 为字符串
+    time_slice['Src IP'] = time_slice['Src IP'].astype(str).str.strip()
+    time_slice['Dst IP'] = time_slice['Dst IP'].astype(str).str.strip()
+
+    # 使用 Hash ID
+    src_ids = time_slice['Src IP'].apply(get_ip_id_hash).values.astype(np.int64)
+    dst_ids = time_slice['Dst IP'].apply(get_ip_id_hash).values.astype(np.int64)
+
+    # 标签处理
+    if 'Label' in time_slice.columns:
+        if pd.api.types.is_numeric_dtype(time_slice['Label']):
+            labels = time_slice['Label'].values.astype(int)
+        else:
+            labels = np.zeros(len(time_slice), dtype=int)
+    else:
+        labels = np.zeros(len(time_slice), dtype=int)
+
+    # 构建局部图索引
+    all_nodes_in_slice = np.concatenate([src_ids, dst_ids])
+    unique_nodes, inverse_indices = np.unique(all_nodes_in_slice, return_inverse=True)
+    
+    n_nodes = len(unique_nodes)
+    src_local = inverse_indices[:len(src_ids)]
+    dst_local = inverse_indices[len(src_ids):]
+    
+    edge_index = torch.tensor(np.array([src_local, dst_local]), dtype=torch.long)
+    n_id = torch.tensor(unique_nodes, dtype=torch.long)
+    
+    # --- 节点特征 ---
+    ones = torch.ones(edge_index.size(1), dtype=torch.float)
+    in_degrees = torch.zeros(n_nodes, dtype=torch.float)
+    out_degrees = torch.zeros(n_nodes, dtype=torch.float)
+    
+    if edge_index.size(1) > 0:
+        out_degrees.scatter_add_(0, edge_index[0], ones)
+        in_degrees.scatter_add_(0, edge_index[1], ones)
+
+    # 特征: 特权端口
+    src_port_col = 'Src Port' if 'Src Port' in time_slice.columns else 'Source Port'
+    src_port = pd.to_numeric(time_slice.get(src_port_col, 0), errors='coerce').fillna(0).values
+    is_priv_src = (src_port < 1024).astype(np.float32)
+    
+    priv_port_count = torch.zeros(n_nodes, dtype=torch.float)
+    if edge_index.size(1) > 0:
+        priv_port_count.scatter_add_(0, edge_index[0], torch.tensor(is_priv_src, dtype=torch.float))
+    priv_ratio = priv_port_count / (out_degrees + 1e-6)
+
+    # 特征: 流量聚合
+    pkt_col = None
+    for cand in ['Total Fwd Packets', 'Total Fwd Packet', 'Tot Fwd Pkts', 'Fwd Packets', 'Total Fwd Pkts']:
+        if cand in time_slice.columns:
+            pkt_col = cand
+            break
+    
+    if pkt_col is None:
+        fwd_pkts = torch.zeros(edge_index.size(1), dtype=torch.float)
+    else:
+        fwd_pkts = torch.tensor(
+            pd.to_numeric(time_slice[pkt_col], errors='coerce').fillna(0).values,
+            dtype=torch.float,
+        )
+    
+    node_pkt_sum = torch.zeros(n_nodes, dtype=torch.float)
+    if edge_index.size(1) > 0:
+        node_pkt_sum.scatter_add_(0, edge_index[0], fwd_pkts)
+    
+    x = torch.stack(
+        [torch.log1p(in_degrees), torch.log1p(out_degrees), priv_ratio, node_pkt_sum],
+        dim=-1,
+    ).float()
+
+    # --- Subnet ID (全0占位，避免越界) ---
+    subnet_id = torch.zeros(n_nodes, dtype=torch.long)
+
+    # --- 边特征 ---
+    drop_cols = ['Src IP', 'Dst IP', 'Flow ID', 'Label', 'Timestamp', 'Src Port', 'Dst Port', 
+                 'Source IP', 'Destination IP', 'Source Port', 'Destination Port', 'time_idx']
+    edge_attr_vals = time_slice.drop(columns=drop_cols, errors='ignore').select_dtypes(include=[np.number]).values
+    edge_attr = torch.tensor(edge_attr_vals, dtype=torch.float)
+
+    if edge_index.size(1) > 0:
+        edge_labels = torch.tensor(labels, dtype=torch.long)
+        data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr, edge_labels=edge_labels, n_id=n_id)
+        data.subnet_id = subnet_id
+        return data
+    else:
+        return None
+
+# ==========================================
+# 2. Dataset & Collate
+# ==========================================
+class TemporalGraphDataset(torch.utils.data.Dataset):
+    def __init__(self, graph_data_seq, seq_len=8):
+        self.graph_data_seq = [g for g in graph_data_seq if g is not None]
+        self.seq_len = seq_len
+    
+    def __len__(self):
+        return max(0, len(self.graph_data_seq) - self.seq_len + 1)
+
+    def __getitem__(self, idx):
+        return self.graph_data_seq[idx : idx + self.seq_len]
+
+def temporal_collate_fn(batch):
+    if len(batch) == 0: return []
+    seq_len = len(batch[0])
+    batched_seq = []
+    for t in range(seq_len):
+        graphs_at_t = [sample[t] for sample in batch]
+        batched_seq.append(Batch.from_data_list(graphs_at_t))
+    return batched_seq
+
+def _pad_seq_for_last_frame_coverage(graph_seqs, seq_len):
+    if graph_seqs is None or len(graph_seqs) == 0:
+        return graph_seqs
+    pad_n = max(0, int(seq_len) - 1)
+    if pad_n == 0:
+        return graph_seqs
+    first = graph_seqs[0]
+    pads = []
+    for _ in range(pad_n):
+        pads.append(first.clone() if hasattr(first, "clone") else first)
+    return pads + list(graph_seqs)
+
+
+def run_one_experiment(
+    group,
+    h,
+    base_train_seqs,
+    base_val_seqs,
+    base_test_seqs,
+    edge_dim,
+    class_names,
+    weights_cpu,
+    device,
+):
+    group = (group or "").strip().upper()
+    group_tag = group if group else "CUSTOM"
+
+    seq_len = int(h["SEQ_LEN"])
+    batch_size = int(h["BATCH_SIZE"])
+    num_epochs = int(h["NUM_EPOCHS"])
+    lr = float(h["LR"])
+    hidden = int(h["HIDDEN"])
+    heads = int(h["HEADS"])
+    kernels = list(h["KERNELS"])
+    patience = int(h["PATIENCE"])
+    min_delta = float(h["MIN_DELTA"])
+    early_stop_metric = str(h["EARLY_STOP_METRIC"])
+    cl_loss_weight = float(h["CL_LOSS_WEIGHT"])
+    accum_steps = max(1, int(h.get("ACCUM_STEPS", 1)))
+    max_cl_edges = int(h.get("MAX_CL_EDGES", 2048))
+    drop_path = float(h.get("DROP_PATH", 0.1))
+    dropedge_p = float(h.get("DROPEDGE_P", 0.2))
+    cl_view1_dropedge_p = float(h.get("CL_VIEW1_DROPEDGE_P", 0.1))
+    cl_view2_dropedge_p = float(h.get("CL_VIEW2_DROPEDGE_P", 0.2))
+    warmup_epochs = max(0, int(h.get("WARMUP_EPOCHS", 5)))
+    cosine_t0 = max(1, int(h.get("COSINE_T0", 10)))
+    cosine_tmult = max(1, int(h.get("COSINE_TMULT", 1)))
+    eta_min_ratio = float(h.get("ETA_MIN_RATIO", 0.01))
+    target_far = float(h.get("TARGET_FAR", 0.03))
+
+    if len(base_train_seqs) < seq_len or len(base_val_seqs) < 1 or len(base_test_seqs) < 1:
+        print(
+            f"Skip {group_tag}: SEQ_LEN={seq_len} too long for available sequences "
+            f"(train={len(base_train_seqs)}, val={len(base_val_seqs)}, test={len(base_test_seqs)})",
+            flush=True,
+        )
+        return
+
+    val_seqs = _pad_seq_for_last_frame_coverage(base_val_seqs, seq_len)
+    test_seqs = _pad_seq_for_last_frame_coverage(base_test_seqs, seq_len)
+
+    train_dataset = TemporalGraphDataset(base_train_seqs, seq_len=seq_len)
+    val_dataset = TemporalGraphDataset(val_seqs, seq_len=seq_len)
+    test_dataset = TemporalGraphDataset(test_seqs, seq_len=seq_len)
+
+    if len(train_dataset) == 0 or len(val_dataset) == 0 or len(test_dataset) == 0:
+        print(
+            f"Skip {group_tag}: empty dataset windows (train={len(train_dataset)}, val={len(val_dataset)}, test={len(test_dataset)})",
+            flush=True,
+        )
+        return
+
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True, collate_fn=temporal_collate_fn
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=batch_size, shuffle=False, collate_fn=temporal_collate_fn
+    )
+    test_loader = DataLoader(
+        test_dataset, batch_size=batch_size, shuffle=False, collate_fn=temporal_collate_fn
+    )
+
+    print(
+        f"\n=== Experiment {group_tag} ===\n"
+        f"SEQ_LEN={seq_len}, BATCH_SIZE={batch_size}, LR={lr}, HIDDEN={hidden}, HEADS={heads}, "
+        f"KERNELS={kernels}, NUM_EPOCHS={num_epochs}, PATIENCE={patience}, MIN_DELTA={min_delta}, "
+        f"EARLY_STOP_METRIC={early_stop_metric}, CL_LOSS_WEIGHT={cl_loss_weight}, "
+        f"ACCUM_STEPS={accum_steps}, DROP_PATH={drop_path}, DROPEDGE_P={dropedge_p}, "
+        f"CL_VIEW1_DROPEDGE_P={cl_view1_dropedge_p}, CL_VIEW2_DROPEDGE_P={cl_view2_dropedge_p}, "
+        f"WARMUP_EPOCHS={warmup_epochs}, COSINE_T0={cosine_t0}, COSINE_TMULT={cosine_tmult}, ETA_MIN_RATIO={eta_min_ratio}",
+        flush=True,
+    )
+
+    model = MILAN(
+        node_in=4,
+        edge_in=edge_dim,
+        hidden=hidden,
+        num_classes=len(class_names),
+        seq_len=seq_len,
+        heads=heads,
+        dropout=0.3,
+        max_cl_edges=max_cl_edges,
+        kernels=kernels,
+        drop_path=drop_path,
+        dropedge_p=dropedge_p,
+        cl_view1_dropedge_p=cl_view1_dropedge_p,
+        cl_view2_dropedge_p=cl_view2_dropedge_p,
+    ).to(device)
+
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    eta_min = max(0.0, lr * float(eta_min_ratio))
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=cosine_t0, T_mult=cosine_tmult, eta_min=eta_min
+    )
+
+    criterion = nn.CrossEntropyLoss(weight=weights_cpu.to(device))
+
+    os.makedirs("models/ids2017_full", exist_ok=True)
+    os.makedirs("png/ids2017_full", exist_ok=True)
+    kernel_tag = "-".join(str(k) for k in kernels)
+    run_tag = f"{group_tag}_seq{seq_len}_h{hidden}_k{kernel_tag}_cls{len(class_names)}"
+    best_model_path = f"models/ids2017_full/best_model_{run_tag}.pth"
+
+    print(f"Best model will be saved to: {best_model_path}", flush=True)
+
+    print("🔥 Start Training...", flush=True)
+    start_time = time.time()
+
+    best_metric = -float("inf")
+    no_improve_epochs = 0
+
+    scaler = GradScaler(enabled=(device.type == "cuda"))
+    num_train_steps = max(1, len(train_loader))
+    num_opt_steps_per_epoch = max(1, (num_train_steps + accum_steps - 1) // accum_steps)
+    warmup_total_steps = int(warmup_epochs) * int(num_opt_steps_per_epoch)
+    global_opt_step = 0
+
+    for epoch in range(num_epochs):
+        model.train()
+        total_loss = 0.0
+        total_cl_loss = 0.0
+        cl_loss_steps = 0
+
+        loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}", leave=False)
+        optimizer.zero_grad(set_to_none=True)
+        for step, batched_seq in enumerate(loop):
+            if not batched_seq:
+                continue
+            batched_seq = [g.to(device) for g in batched_seq]
+
+            with autocast(enabled=(device.type == "cuda")):
+                out = model(graphs=batched_seq)
+                all_preds, cl_loss = out if isinstance(out, tuple) else (out, None)
+                last_frame_pred = all_preds[-1]
+
+                edge_masks = getattr(model, "_last_edge_masks", None)
+                if edge_masks is not None and len(edge_masks) > 0 and edge_masks[-1] is not None:
+                    last_frame_labels = batched_seq[-1].edge_labels[edge_masks[-1]]
+                else:
+                    last_frame_labels = batched_seq[-1].edge_labels
+
+                main_loss = criterion(last_frame_pred, last_frame_labels)
+                if torch.is_tensor(cl_loss):
+                    full_loss = main_loss + cl_loss_weight * cl_loss
+                else:
+                    full_loss = main_loss
+                loss = full_loss / float(accum_steps)
+
+            scaler.scale(loss).backward()
+
+            total_loss += float(full_loss.detach().item())
+            if torch.is_tensor(cl_loss):
+                total_cl_loss += float(cl_loss.detach().item())
+                cl_loss_steps += 1
+
+            do_step = ((step + 1) % accum_steps == 0) or ((step + 1) == len(train_loader))
+            if do_step:
+                if warmup_total_steps > 0 and global_opt_step < warmup_total_steps:
+                    warm_lr = lr * float(global_opt_step + 1) / float(warmup_total_steps)
+                    for pg in optimizer.param_groups:
+                        pg["lr"] = float(warm_lr)
+                else:
+                    progress = float(epoch) + float(step + 1) / float(num_train_steps)
+                    scheduler.step(progress - float(warmup_epochs))
+
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                global_opt_step += 1
+
+            if torch.is_tensor(cl_loss):
+                loop.set_postfix(loss=float(full_loss.detach().item()), cl_loss=float(cl_loss.detach().item()))
+            else:
+                loop.set_postfix(loss=float(full_loss.detach().item()))
+
+        avg_loss = total_loss / max(1, len(train_loader))
+        avg_cl_loss = total_cl_loss / max(1, cl_loss_steps)
+
+        model.eval()
+        total_val_loss = 0.0
+        with torch.no_grad():
+            for batched_seq in val_loader:
+                if not batched_seq:
+                    continue
+                batched_seq = [g.to(device) for g in batched_seq]
+                out = model(graphs=batched_seq)
+                all_preds = out[0] if isinstance(out, tuple) else out
+                val_loss = criterion(all_preds[-1], batched_seq[-1].edge_labels)
+                total_val_loss += val_loss.item()
+
+        avg_val_loss = total_val_loss / max(1, len(val_loader))
+
+        val_acc, val_prec, val_rec, val_f1, val_far, val_auc, val_asa, _, _ = evaluate_comprehensive_with_threshold(
+            model, val_loader, device, class_names, threshold=0.5
+        )
+
+        current_lr = optimizer.param_groups[0]["lr"]
+        print(
+            f"[{group_tag}] Epoch {epoch+1} | Loss: {avg_loss:.4f} | Val Loss: {avg_val_loss:.4f} | "
+            f"Val F1: {val_f1:.4f} | ASA: {val_asa:.4f} | CL Loss: {avg_cl_loss:.4f} | LR: {current_lr:.6f}",
+            flush=True,
+        )
+
+        metric_value = val_f1 if early_stop_metric == "val_f1" else val_asa
+        metric_display = "Val F1" if early_stop_metric == "val_f1" else "Val ASA"
+
+        if metric_value > best_metric + min_delta:
+            best_metric = metric_value
+            no_improve_epochs = 0
+            torch.save(
+                {
+                    "state_dict": model.state_dict(),
+                    "seq_len": seq_len,
+                    "num_classes": len(class_names),
+                    "class_names": class_names,
+                    "edge_dim": edge_dim,
+                },
+                best_model_path,
+            )
+            print(f"[{group_tag}] New Best Model Saved! ({metric_display}: {best_metric:.4f})", flush=True)
+        else:
+            no_improve_epochs += 1
+            if no_improve_epochs >= patience:
+                print(f"[{group_tag}] ⏹️ Early Stopping at Epoch {epoch+1}", flush=True)
+                break
+
+    print(f"\n[{group_tag}] Loading Best Model for Final Testing...", flush=True)
+    if os.path.exists(best_model_path):
+        try:
+            ckpt = torch.load(best_model_path, map_location=device)
+            if isinstance(ckpt, dict) and "state_dict" in ckpt:
+                model.load_state_dict(ckpt["state_dict"], strict=True)
+            else:
+                model.load_state_dict(ckpt, strict=True)
+        except Exception as e:
+            print(f"[{group_tag}] ⚠️ Failed to load best model: {e}", flush=True)
+
+    print(f"\n[{group_tag}] === Post-Training Threshold Optimization ===", flush=True)
+    y_true_attack, y_score = _collect_attack_scores(model, test_loader, device, class_names)
+    best_thresh, best_f1, best_far, best_asa = _attack_best_threshold(y_true_attack, y_score, max_far=target_far)
+    print(
+        f"[{group_tag}] Best Threshold -> th={best_thresh:.4f}, F1={best_f1:.4f}, FAR={best_far:.4f}, ASA={best_asa:.4f}",
+        flush=True,
+    )
+
+    final_acc, final_prec, final_rec, final_f1, final_far, final_auc, final_asa, final_labels, final_preds = evaluate_comprehensive_with_threshold(
+        model, test_loader, device, class_names, threshold=best_thresh
+    )
+
+    present = np.unique(np.asarray(final_labels, dtype=np.int64))
+    missing = sorted(list(set(range(len(class_names))) - set(present.tolist())))
+    counts = np.bincount(np.asarray(final_labels, dtype=np.int64), minlength=len(class_names))
+    print(f"[{group_tag}] Final Labels Present IDs: {present.tolist()}", flush=True)
+    if len(missing) > 0:
+        missing_names = [class_names[i] for i in missing if i < len(class_names)]
+        print(f"[{group_tag}] ⚠️ Final Labels Missing IDs: {missing} ({missing_names})", flush=True)
+    nonzero_pairs = []
+    for i, c in enumerate(counts.tolist()):
+        if c > 0:
+            nonzero_pairs.append(f"{class_names[i]}({i}):{c}")
+    print(f"[{group_tag}] Final Labels Counts -> " + ", ".join(nonzero_pairs), flush=True)
+    print(
+        f"[{group_tag}] Final Test -> ACC: {final_acc:.4f}, PREC: {final_prec:.4f}, Rec: {final_rec:.4f}, "
+        f"F1: {final_f1:.4f}, AUC: {final_auc:.4f}, ASA: {final_asa:.4f}",
+        flush=True,
+    )
+
+    try:
+        labels_idx = list(range(len(class_names)))
+        cm = confusion_matrix(final_labels, final_preds, labels=labels_idx)
+        cm = np.asarray(cm, dtype=np.float64)
+        row_sums = cm.sum(axis=1, keepdims=True)
+        cm_pct = np.divide(cm, row_sums, out=np.zeros_like(cm), where=row_sums != 0) * 100.0
+
+        import seaborn as sns
+
+        plt.figure(figsize=(10, 8))
+        sns.heatmap(
+            cm_pct,
+            annot=True,
+            fmt=".1f",
+            cmap="Blues",
+            xticklabels=class_names,
+            yticklabels=class_names,
+        )
+        plt.title(f"{group_tag} Confusion Matrix (Threshold={best_thresh})")
+        plt.tight_layout()
+        plt.savefig(f"png/ids2017_full/FINAL_CM_{run_tag}.png", dpi=300)
+        print(f"[{group_tag}] Confusion Matrix Saved.", flush=True)
+    except Exception as e:
+        print(f"[{group_tag}] Plotting failed: {e}", flush=True)
+
+    print(f"[{group_tag}] Total Time: {time.time() - start_time:.2f}s", flush=True)
+
+# ==========================================
+# 3. 主训练流程
+# ==========================================
+def main():
+    # --- 配置 ---
+    # 指向存放 IDS2017 所有 CSV 的文件夹
+    DATA_DIR = os.getenv("DATA_DIR", "data/CIC-IDS2017/TrafficLabelling_")
+    
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using Device: {DEVICE}")
+
+    # --- 1. 批量加载与拼接 CSV ---
+    print(f"Scanning CSV files in {DATA_DIR}...")
+    csv_files = glob.glob(os.path.join(DATA_DIR, "*.csv"))
+    if not csv_files:
+        print(f"No CSV files found in {DATA_DIR}. Please check the path.")
+        return
+    
+    data_frames = []
+    for file_path in tqdm(csv_files, desc="Loading CSVs"):
+        try:
+            df = pd.read_csv(file_path, encoding="latin1", low_memory=False)
+            df.columns = df.columns.str.strip()
+            
+            rename_map = {
+                "Source IP": "Src IP", "Destination IP": "Dst IP",
+                "Source Port": "Src Port", "Destination Port": "Dst Port",
+                " Timestamp": "Timestamp"
+            }
+            df = df.rename(columns=rename_map)
+            
+            if "Timestamp" not in df.columns: continue
+            data_frames.append(df)
+        except Exception as e:
+            print(f"⚠️ Error reading {file_path}: {e}")
+
+    if not data_frames: return
+
+    print("Concatenating DataFrames...")
+    data = pd.concat(data_frames, ignore_index=True)
+    del data_frames
+
+    # --- 2. 数据清洗 ---
+    print("Cleaning Data...")
+    data["Label"] = data["Label"].astype(str).str.strip()
+    data = data[data["Label"].notna()]
+    data = data[data["Label"] != ""]
+    data = data[~data["Label"].str.lower().isin(["nan", "none"])]
+    
+    # 编码 Label
+    label_encoder = LabelEncoder()
+    data["Label"] = label_encoder.fit_transform(data["Label"])
+    class_names = list(label_encoder.classes_)
+    print(f"🏷️ Classes: {class_names}")
+
+    # 时间处理
+    print("Parsing Timestamps & Sorting...")
+    # IDS2017 常见格式: "dd/MM/yyyy h:mm" 或 "dd/MM/yyyy hh:mm:ss a"
+    data["Timestamp"] = pd.to_datetime(data["Timestamp"], errors="coerce")
+    data.dropna(subset=["Timestamp", "Src IP", "Dst IP"], inplace=True)
+    
+    # 全局按时间排序 (这是时序学习的关键)
+    data = data.sort_values("Timestamp").reset_index(drop=True)
+    data["time_idx"] = data["Timestamp"].dt.floor("min")
+
+    # --- 3. 分层时序划分 (按类别 8:1:1) ---
+    print("Performing Stratified Temporal Split (8:1:1 per class)...")
+    train_list = []
+    val_list = []
+    test_list = []
+
+    for label in np.unique(data["Label"].values):
+        cls_data = data[data["Label"] == label].sort_values("Timestamp")
+        unique_times = cls_data["time_idx"].drop_duplicates().values
+        total_len = len(unique_times)
+
+        if total_len < 3:
+            train_list.append(cls_data)
+            continue
+
+        train_idx = int(total_len * 0.8)
+        val_idx = int(total_len * 0.9)
+
+        train_idx = max(1, train_idx)
+        val_idx = max(train_idx + 1, val_idx)
+        train_idx = min(train_idx, total_len - 2)
+        val_idx = min(val_idx, total_len - 1)
+
+        split_time_train = unique_times[train_idx]
+        split_time_val = unique_times[val_idx]
+
+        train_list.append(cls_data[cls_data["time_idx"] < split_time_train])
+        val_list.append(
+            cls_data[
+                (cls_data["time_idx"] >= split_time_train)
+                & (cls_data["time_idx"] < split_time_val)
+            ]
+        )
+        test_list.append(cls_data[cls_data["time_idx"] >= split_time_val])
+
+    train_df = pd.concat(train_list).sort_values("Timestamp") if len(train_list) > 0 else data.iloc[0:0].copy()
+    val_df = pd.concat(val_list).sort_values("Timestamp") if len(val_list) > 0 else data.iloc[0:0].copy()
+    test_df = pd.concat(test_list).sort_values("Timestamp") if len(test_list) > 0 else data.iloc[0:0].copy()
+    del data
+
+    print(f"Final Split -> Train: {len(train_df)}, Val: {len(val_df)}, Test: {len(test_df)}", flush=True)
+    print(f"Train Set Classes: {np.unique(train_df['Label'].values)}", flush=True)
+    print(f"Val Set Classes: {np.unique(val_df['Label'].values)}", flush=True)
+    print(f"Test Set Classes: {np.unique(test_df['Label'].values)}", flush=True)
+
+    def _print_label_counts(df, split_name):
+        vc = df["Label"].value_counts().sort_index()
+        pairs = []
+        for label_id, cnt in vc.items():
+            label_name = class_names[int(label_id)] if int(label_id) < len(class_names) else str(label_id)
+            pairs.append(f"{label_name}({int(label_id)}):{int(cnt)}")
+        print(f"{split_name} Label Counts -> " + ", ".join(pairs), flush=True)
+
+    _print_label_counts(train_df, "Train")
+    _print_label_counts(val_df, "Val")
+    _print_label_counts(test_df, "Test")
+
+    # --- 4. 归一化 ---
+    print("Pre-processing & Normalization...")
+    numeric_cols = train_df.select_dtypes(include=[np.number]).columns.tolist()
+    exclude_cols = {"Label", "Timestamp", "Src IP", "Dst IP", "Flow ID", "Src Port", "Dst Port", "time_idx"}
+    feat_cols = [c for c in numeric_cols if c not in exclude_cols]
+    
+    # 清洗 Inf/NaN 并填充 0
+    for df in [train_df, val_df, test_df]:
+        df[feat_cols] = df[feat_cols].replace([np.inf, -np.inf], np.nan).fillna(0)
+    
+    # Log1p
+    for col in feat_cols:
+        if train_df[col].max() > 100:
+            train_df[col] = np.log1p(train_df[col].abs())
+            val_df[col] = np.log1p(val_df[col].abs())
+            test_df[col] = np.log1p(test_df[col].abs())
+            
+    scaler = StandardScaler()
+    train_df[feat_cols] = scaler.fit_transform(train_df[feat_cols])
+    val_df[feat_cols] = scaler.transform(val_df[feat_cols])
+    test_df[feat_cols] = scaler.transform(test_df[feat_cols])
+
+    # --- 5. 构建 Graphs ---
+    print("🏗️ Constructing Train Graphs...")
+    subnet_to_idx = {'<UNK>': 0} 
+    
+    train_seqs = []
+    for name, group in tqdm(train_df.groupby('time_idx', sort=True)):
+        g = create_graph_data_inductive(group, subnet_to_idx, None, name)
+        if g: train_seqs.append(g)
+
+    print("🏗️ Constructing Val Graphs...")
+    val_seqs = []
+    for name, group in tqdm(val_df.groupby('time_idx', sort=True)):
+        g = create_graph_data_inductive(group, subnet_to_idx, None, name)
+        if g: val_seqs.append(g)
+
+    print("🏗️ Constructing Test Graphs...")
+    test_seqs = []
+    for name, group in tqdm(test_df.groupby('time_idx', sort=True)):
+        g = create_graph_data_inductive(group, subnet_to_idx, None, name)
+        if g: test_seqs.append(g)
+
+    edge_dim = train_seqs[0].edge_attr.shape[1] if train_seqs else 1
+    print(f"Edge Dim: {edge_dim}", flush=True)
+
+    label_counts = train_df["Label"].value_counts().sort_index()
+    full_counts = np.zeros(len(class_names))
+    for i, count in label_counts.items():
+        idx = int(i)
+        if idx < len(full_counts):
+            full_counts[idx] = count
+    weights_cpu = 1.0 / (torch.sqrt(torch.tensor(full_counts, dtype=torch.float)) + 1.0)
+    weights_cpu = weights_cpu / weights_cpu.sum() * len(class_names)
+
+    raw_groups = os.getenv("HP_GROUPS", "").strip()
+    if raw_groups:
+        raw = raw_groups.replace(";", ",").replace("\n", ",").replace(" ", ",")
+        groups = [g.strip() for g in raw.split(",") if g.strip()]
+    else:
+        groups = [os.getenv("HP_GROUP", "").strip()]
+
+    overall_start = time.time()
+    for g in groups:
+        h = resolve_hparams(g, env=os.environ)
+        run_one_experiment(
+            g,
+            h,
+            train_seqs,
+            val_seqs,
+            test_seqs,
+            edge_dim,
+            class_names,
+            weights_cpu,
+            DEVICE,
+        )
+
+    print(f"\nAll Experiments Done. Total Time: {time.time() - overall_start:.2f}s", flush=True)
+
+if __name__ == "__main__":
+    main()
+
+# HP_GROUP=A5  python a3_1.py
+# HP_GROUP=A10 python a3_1.py
+# HP_GROUP=A20 python a3_1.py
+# HP_GROUP=A30 python a3_1.py
+# HP_GROUP=A40 python a3_1.py
+# HP_GROUP=A50 python a3_1.py
+# HP_GROUPS=B_S3,B_357,B_3579,B_13579,B_35711,B_357911 NUM_EPOCHS=150 python a3_1.py
+# HP_GROUPS=C0,C001,C005,C01,C05 python a3_1.py
+# HP_GROUPS=D1,D2,D3,D4,D5 python a3_1.py
+# HP_GROUPS=C005 python a3_1.py
