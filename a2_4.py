@@ -15,6 +15,8 @@ import matplotlib.pyplot as plt
 import os
 import time
 import warnings
+import random
+import datetime
 from tqdm import tqdm
 from model import MILAN
 from hparams_a3 import resolve_hparams
@@ -32,6 +34,14 @@ from model_final import ROEN_Final
 # ==========================================
 # 辅助函数：哈希与子网键生成
 # ==========================================
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
 def _subnet_key(ip):
     try:
         parts = str(ip).split(".")
@@ -342,7 +352,8 @@ def run_one_experiment(
     save_dir = "models/2020"
     os.makedirs(save_dir, exist_ok=True)
     kernel_tag = "-".join(str(k) for k in kernels)
-    run_tag = f"{group_tag}_seq{seq_len}_h{hidden}_k{kernel_tag}_cls{len(class_names)}"
+    time_str = datetime.datetime.now().strftime("%m%d_%H%M")
+    run_tag = f"{group_tag}_seq{seq_len}_h{hidden}_k{kernel_tag}_cls{len(class_names)}_{time_str}"
     best_model_path = os.path.join(save_dir, f"roen_final_best_{run_tag}.pth")
     print(f"Best model will be saved to: {best_model_path}", flush=True)
 
@@ -545,6 +556,16 @@ def run_one_experiment(
         flush=True,
     )
 
+    log_file = "experiment_results.csv"
+    file_exists = os.path.isfile(log_file)
+    with open(log_file, "a", encoding="utf-8") as f:
+        if not file_exists:
+            f.write("Dataset,Group,SeqLen,Hidden,Heads,DropEdge,Threshold,F1,ASA,FAR,AUC\n")
+        f.write(
+            f"Darknet2020,{group_tag},{seq_len},{hidden},{heads},{dropedge_p},{optimal_thresh:.6f},"
+            f"{opt_f1:.4f},{opt_asa:.4f},{opt_far:.4f},{opt_auc:.4f}\n"
+        )
+
     labels_idx = list(range(len(class_names)))
     cm = confusion_matrix(final_labels, final_preds, labels=labels_idx)
     cm = np.asarray(cm, dtype=np.float64)
@@ -585,6 +606,7 @@ def run_one_experiment(
 # 3. 主训练流程
 # ==========================================
 def main():
+    set_seed(int(os.getenv("SEED", "42")))
     # --- 配置 ---
     CSV_PATH = os.getenv("CSV_PATH", "data/CIC-Darknet2020/Darknet.csv")
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")

@@ -14,6 +14,8 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import os
 import time
+import random
+import datetime
 from tqdm import tqdm
 # from analys import FocalLoss
 from analys import (
@@ -33,6 +35,14 @@ from model import MILAN
 # ==========================================
 # 辅助函数
 # ==========================================
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
 def _subnet_key(ip):
     try:
         parts = str(ip).split(".")
@@ -391,7 +401,8 @@ def run_one_experiment(
     os.makedirs("models/nb15", exist_ok=True)
     os.makedirs("png/nb15", exist_ok=True)
     kernel_tag = "-".join(str(k) for k in kernels)
-    run_tag = f"{group_tag}_seq{seq_len}_h{hidden}_k{kernel_tag}_cls{len(class_names)}"
+    time_str = datetime.datetime.now().strftime("%m%d_%H%M")
+    run_tag = f"{group_tag}_seq{seq_len}_h{hidden}_k{kernel_tag}_cls{len(class_names)}_{time_str}"
     best_model_path = f"models/nb15/best_model_{run_tag}.pth"
     print(f"Best model will be saved to: {best_model_path}", flush=True)
 
@@ -572,6 +583,16 @@ def run_one_experiment(
         flush=True,
     )
 
+    log_file = "experiment_results.csv"
+    file_exists = os.path.isfile(log_file)
+    with open(log_file, "a", encoding="utf-8") as f:
+        if not file_exists:
+            f.write("Dataset,Group,SeqLen,Hidden,Heads,DropEdge,Threshold,F1,ASA,FAR,AUC\n")
+        f.write(
+            f"NB15,{group_tag},{seq_len},{hidden},{heads},{dropedge_p},{best_thresh:.6f},"
+            f"{final_f1:.4f},{final_asa:.4f},{final_far:.4f},{final_auc:.4f}\n"
+        )
+
     try:
         labels_idx = list(range(len(class_names)))
         cm = confusion_matrix(final_labels, final_preds, labels=labels_idx)
@@ -601,6 +622,7 @@ def temporal_split(data_list, test_size=0.2):
     return data_list[:split_idx], data_list[split_idx:]
 
 def main():
+    set_seed(int(os.getenv("SEED", "42")))
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print("Loading NB15 Data (CICFlowMeter Format)...")
