@@ -734,10 +734,13 @@ def main():
         groups = [g.strip() for g in raw.split(",") if g.strip()]
     else:
         groups = [os.getenv("HP_GROUP", "").strip()]
+    groups = [g for g in groups if str(g).strip() != ""]
+    if len(groups) == 0:
+        groups = ["BEST"]
 
     overall_start = time.time()
     for g in groups:
-        h = resolve_hparams(g, env=os.environ)
+        h = resolve_hparams(g, env=os.environ, dataset="ids2017")
         run_one_experiment(
             g,
             h,

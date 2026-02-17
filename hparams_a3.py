@@ -14,6 +14,21 @@ def _parse_int_list(text, fallback):
     return out
 
 
+def _canonical_dataset_name(name):
+    s = str(name or "").strip().lower()
+    if not s:
+        return ""
+    if s in {"nb15", "unsw-nb15", "unsw_nb15", "unswnb15"}:
+        return "nb15"
+    if s in {"darknet2020", "cic-darknet2020", "cic_darknet2020", "darknet"}:
+        return "darknet2020"
+    if s in {"ids2017", "cicids2017", "cic-ids2017", "cic_ids2017"}:
+        return "ids2017"
+    if s in {"iscx2012", "iscx-ids2012", "iscx_ids2012", "2012", "ids2012"}:
+        return "iscx2012"
+    return s
+
+
 GROUPS = {
     "A5": {"SEQ_LEN": 5, "HIDDEN": 64, "KERNELS": [1, 3, 5, 7], "CL_LOSS_WEIGHT": 0.1},
     "A10": {"SEQ_LEN": 10, "HIDDEN": 64, "KERNELS": [1, 3, 5, 7], "CL_LOSS_WEIGHT": 0.1},
@@ -70,7 +85,15 @@ GROUPS = {
 }
 
 
-def resolve_hparams(group, env=None):
+DATASET_BEST = {
+    "darknet2020": {"DROPEDGE_P": 0.3, "CL_LOSS_WEIGHT": 0.5},
+    "nb15": None,
+    "ids2017": None,
+    "iscx2012": None,
+}
+
+
+def resolve_hparams(group, env=None, dataset=None):
     if env is None:
         env = os.environ
 
@@ -103,9 +126,21 @@ def resolve_hparams(group, env=None):
         "TARGET_FAR": float(env.get("TARGET_FAR", "0.01")),
     }
 
-    group = (group or "").strip().upper()
-    if group in GROUPS:
-        for k, v in GROUPS[group].items():
+    dataset_name = dataset if dataset is not None else env.get("DATASET", None)
+    dataset_name = _canonical_dataset_name(dataset_name)
+    best = DATASET_BEST.get(dataset_name, None)
+    if isinstance(best, dict):
+        for k, v in best.items():
+            if k == "CL_LOSS_WEIGHT":
+                if ("CL_LOSS_WEIGHT" not in env) and ("CL_WEIGHT" not in env):
+                    h[k] = v
+                continue
+            if k not in env:
+                h[k] = v
+
+    group_norm = (group or "").strip().upper()
+    if group_norm not in {"", "BEST", "AUTO", "DEFAULT"} and group_norm in GROUPS:
+        for k, v in GROUPS[group_norm].items():
             if k == "CL_LOSS_WEIGHT":
                 if ("CL_LOSS_WEIGHT" not in env) and ("CL_WEIGHT" not in env):
                     h[k] = v
