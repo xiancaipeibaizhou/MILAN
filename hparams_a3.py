@@ -87,7 +87,7 @@ def resolve_hparams(group, env=None):
         "HIDDEN": int(env.get("HIDDEN", "128")),
         "HEADS": int(env.get("HEADS", "8")),
         "KERNELS": _parse_int_list(env.get("KERNELS", ""), fallback=[1, 3, 5, 7]),
-        "MAX_CL_EDGES": int(env.get("MAX_CL_EDGES", "2048")),
+        "MAX_CL_EDGES": int(env.get("MAX_CL_EDGES", "8192")),
         "PATIENCE": int(env.get("PATIENCE", "10")),
         "MIN_DELTA": float(env.get("MIN_DELTA", "0.0")),
         "EARLY_STOP_METRIC": str(env.get("EARLY_STOP_METRIC", "val_f1")).strip().lower(),

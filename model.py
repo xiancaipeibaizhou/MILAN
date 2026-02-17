@@ -267,8 +267,14 @@ class MILAN(nn.Module):
         self.cl_view2_dropedge_p = float(cl_view2_dropedge_p)
         
         # --- Encoders ---
-        self.node_enc = nn.Linear(node_in, hidden)
-        self.edge_enc = nn.Linear(edge_in, hidden)
+        self.node_enc = nn.Sequential(
+            nn.Linear(node_in, hidden),
+            nn.LayerNorm(hidden),
+        )
+        self.edge_enc = nn.Sequential(
+            nn.Linear(edge_in, hidden),
+            nn.LayerNorm(hidden),
+        )
         
         # --- Spatial Layers (Phase 1) ---
         self.num_layers = 2
