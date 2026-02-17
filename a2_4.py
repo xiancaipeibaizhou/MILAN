@@ -3,7 +3,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.cuda.amp import autocast, GradScaler
 import hashlib
 from torch_geometric.loader import DataLoader
 from torch_geometric.data import Batch, Data
@@ -30,7 +29,7 @@ from analys import (
     evaluate_with_threshold,
 )
 # from ROEN_Final import ROEN_Final
-from model_final import ROEN_Final
+
 # ==========================================
 # 辅助函数：哈希与子网键生成
 # ==========================================
@@ -363,7 +362,6 @@ def run_one_experiment(
     best_metric = -float("inf")
     no_improve_epochs = 0
 
-    scaler = GradScaler(enabled=(device.type == "cuda"))
     num_train_steps = max(1, len(train_loader))
     num_opt_steps_per_epoch = max(1, (num_train_steps + accum_steps - 1) // accum_steps)
     warmup_total_steps = int(warmup_epochs) * int(num_opt_steps_per_epoch)
@@ -382,25 +380,24 @@ def run_one_experiment(
                 continue
             batched_seq = [g.to(device) for g in batched_seq]
 
-            with autocast(enabled=(device.type == "cuda")):
-                out = model(graphs=batched_seq)
-                all_preds, cl_loss = out if isinstance(out, tuple) else (out, None)
-                last_frame_pred = all_preds[-1]
+            out = model(graphs=batched_seq)
+            all_preds, cl_loss = out if isinstance(out, tuple) else (out, None)
+            last_frame_pred = all_preds[-1]
 
-                edge_masks = getattr(model, "_last_edge_masks", None)
-                if edge_masks is not None and len(edge_masks) > 0 and edge_masks[-1] is not None:
-                    last_frame_labels = batched_seq[-1].edge_labels[edge_masks[-1]]
-                else:
-                    last_frame_labels = batched_seq[-1].edge_labels
+            edge_masks = getattr(model, "_last_edge_masks", None)
+            if edge_masks is not None and len(edge_masks) > 0 and edge_masks[-1] is not None:
+                last_frame_labels = batched_seq[-1].edge_labels[edge_masks[-1]]
+            else:
+                last_frame_labels = batched_seq[-1].edge_labels
 
-                main_loss = criterion(last_frame_pred, last_frame_labels)
-                if torch.is_tensor(cl_loss):
-                    full_loss = main_loss + cl_loss_weight * cl_loss
-                else:
-                    full_loss = main_loss
-                loss = full_loss / float(accum_steps)
+            main_loss = criterion(last_frame_pred, last_frame_labels)
+            if torch.is_tensor(cl_loss):
+                full_loss = main_loss + cl_loss_weight * cl_loss
+            else:
+                full_loss = main_loss
+            loss = full_loss / float(accum_steps)
 
-            scaler.scale(loss).backward()
+            loss.backward()
 
             total_loss += float(full_loss.detach().item())
             if torch.is_tensor(cl_loss):
@@ -417,10 +414,8 @@ def run_one_experiment(
                     progress = float(epoch) + float(step + 1) / float(num_train_steps)
                     scheduler.step(progress - float(warmup_epochs))
 
-                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
+                optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 global_opt_step += 1
 

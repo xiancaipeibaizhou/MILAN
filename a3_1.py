@@ -11,7 +11,6 @@ import random
 import datetime
 from tqdm import tqdm
 from hparams_a3 import resolve_hparams
-from torch.cuda.amp import autocast, GradScaler
 from torch_geometric.loader import DataLoader
 from torch_geometric.data import Batch, Data
 from sklearn.preprocessing import LabelEncoder, StandardScaler
@@ -32,7 +31,7 @@ try:
         evaluate_comprehensive_with_threshold,
         evaluate_with_threshold,
     )
-    from model_final import ROEN_Final
+    from model import MILAN
 except ImportError:
     print("❌ Error: analys.py or model_Final.py not found. Please check your directory.")
     exit()
@@ -331,7 +330,6 @@ def run_one_experiment(
     best_metric = -float("inf")
     no_improve_epochs = 0
 
-    scaler = GradScaler(enabled=(device.type == "cuda"))
     num_train_steps = max(1, len(train_loader))
     num_opt_steps_per_epoch = max(1, (num_train_steps + accum_steps - 1) // accum_steps)
     warmup_total_steps = int(warmup_epochs) * int(num_opt_steps_per_epoch)
@@ -350,25 +348,24 @@ def run_one_experiment(
                 continue
             batched_seq = [g.to(device) for g in batched_seq]
 
-            with autocast(enabled=(device.type == "cuda")):
-                out = model(graphs=batched_seq)
-                all_preds, cl_loss = out if isinstance(out, tuple) else (out, None)
-                last_frame_pred = all_preds[-1]
+            out = model(graphs=batched_seq)
+            all_preds, cl_loss = out if isinstance(out, tuple) else (out, None)
+            last_frame_pred = all_preds[-1]
 
-                edge_masks = getattr(model, "_last_edge_masks", None)
-                if edge_masks is not None and len(edge_masks) > 0 and edge_masks[-1] is not None:
-                    last_frame_labels = batched_seq[-1].edge_labels[edge_masks[-1]]
-                else:
-                    last_frame_labels = batched_seq[-1].edge_labels
+            edge_masks = getattr(model, "_last_edge_masks", None)
+            if edge_masks is not None and len(edge_masks) > 0 and edge_masks[-1] is not None:
+                last_frame_labels = batched_seq[-1].edge_labels[edge_masks[-1]]
+            else:
+                last_frame_labels = batched_seq[-1].edge_labels
 
-                main_loss = criterion(last_frame_pred, last_frame_labels)
-                if torch.is_tensor(cl_loss):
-                    full_loss = main_loss + cl_loss_weight * cl_loss
-                else:
-                    full_loss = main_loss
-                loss = full_loss / float(accum_steps)
+            main_loss = criterion(last_frame_pred, last_frame_labels)
+            if torch.is_tensor(cl_loss):
+                full_loss = main_loss + cl_loss_weight * cl_loss
+            else:
+                full_loss = main_loss
+            loss = full_loss / float(accum_steps)
 
-            scaler.scale(loss).backward()
+            loss.backward()
 
             total_loss += float(full_loss.detach().item())
             if torch.is_tensor(cl_loss):
@@ -385,10 +382,8 @@ def run_one_experiment(
                     progress = float(epoch) + float(step + 1) / float(num_train_steps)
                     scheduler.step(progress - float(warmup_epochs))
 
-                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0)
-                scaler.step(optimizer)
-                scaler.update()
+                optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 global_opt_step += 1
 
@@ -409,13 +404,14 @@ def run_one_experiment(
                 batched_seq = [g.to(device) for g in batched_seq]
                 out = model(graphs=batched_seq)
                 all_preds = out[0] if isinstance(out, tuple) else out
-                val_loss = criterion(all_preds[-1], batched_seq[-1].edge_labels)
+                val_logits = all_preds[-1]
+                val_loss = criterion(val_logits, batched_seq[-1].edge_labels)
                 total_val_loss += val_loss.item()
 
         avg_val_loss = total_val_loss / max(1, len(val_loader))
 
-        val_acc, val_prec, val_rec, val_f1, val_far, val_auc, val_asa, _, _ = evaluate_comprehensive_with_threshold(
-            model, val_loader, device, class_names, threshold=0.5
+        val_acc, val_prec, val_rec, val_f1, val_far, val_auc, val_asa = evaluate_comprehensive(
+            model, val_loader, device, class_names
         )
 
         current_lr = optimizer.param_groups[0]["lr"]
@@ -545,7 +541,7 @@ def main():
     set_seed(int(os.getenv("SEED", "42")))
     # --- 配置 ---
     # 指向存放 IDS2017 所有 CSV 的文件夹
-    DATA_DIR = os.getenv("DATA_DIR", "data/CIC-IDS2017/TrafficLabelling_")
+    DATA_DIR = os.getenv("DATA_DIR", "data/2017/TrafficLabelling_")
     
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using Device: {DEVICE}")
@@ -726,6 +722,10 @@ def main():
         if idx < len(full_counts):
             full_counts[idx] = count
     weights_cpu = 1.0 / (torch.sqrt(torch.tensor(full_counts, dtype=torch.float)) + 1.0)
+
+    max_weight_limit = weights_cpu[0] * 20.0
+    weights_cpu = torch.clamp(weights_cpu, max=max_weight_limit)
+
     weights_cpu = weights_cpu / weights_cpu.sum() * len(class_names)
 
     raw_groups = os.getenv("HP_GROUPS", "").strip()

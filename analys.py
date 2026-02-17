@@ -4,6 +4,10 @@ import numpy as np
 import torch
 from sklearn.metrics import recall_score, f1_score, roc_auc_score, precision_score, confusion_matrix
 import torch.nn.functional as F
+try:
+    from tqdm import tqdm as _tqdm
+except Exception:
+    _tqdm = None
 
 def _infer_normal_indices(class_names):
     normal_indices = []
@@ -170,8 +174,11 @@ def _collect_attack_scores(model, dataloader, device, class_names):
 
     all_true_attack = []
     all_scores = []
-    with torch.no_grad():
-        for batched_seq in dataloader:
+    iterable = dataloader
+    if _tqdm is not None:
+        iterable = _tqdm(dataloader, desc="Collecting attack scores", leave=False)
+    with torch.inference_mode():
+        for batched_seq in iterable:
             if not batched_seq:
                 continue
             batched_seq = [g.to(device) for g in batched_seq]
@@ -207,29 +214,20 @@ def _attack_best_threshold(y_true_attack, y_score, max_far=0.01):
     y_score = np.asarray(y_score, dtype=np.float64)
     if y_true_attack.size == 0:
         return 0.5, 0.0, 0.0, 0.0
-
-    try:
-        from sklearn.metrics import precision_recall_curve
-        _, _, thresholds = precision_recall_curve(y_true_attack, y_score)
-        candidates = thresholds if thresholds is not None and len(thresholds) > 0 else None
-    except Exception:
-        candidates = None
-
-    if candidates is None:
-        candidates = np.unique(np.quantile(y_score, np.linspace(0.0, 1.0, 101)))
+    candidates = np.unique(np.quantile(y_score, np.linspace(0.0, 1.0, 101)))
 
     best_th = 0.5
     best_f1 = -1.0
     best_far = 1.0
     best_asa = -1.0
-    for th in np.asarray(candidates, dtype=np.float64):
+    for th in candidates:
         f1, far, asa = _attack_metrics_from_scores(y_true_attack, y_score, float(th))
         if far <= float(max_far):
             if (asa > best_asa) or (asa == best_asa and f1 > best_f1):
                 best_th, best_f1, best_far, best_asa = float(th), float(f1), float(far), float(asa)
 
     if best_asa < 0.0:
-        for th in np.asarray(candidates, dtype=np.float64):
+        for th in candidates:
             f1, far, asa = _attack_metrics_from_scores(y_true_attack, y_score, float(th))
             if (asa > best_asa) or (asa == best_asa and f1 > best_f1):
                 best_th, best_f1, best_far, best_asa = float(th), float(f1), float(far), float(asa)

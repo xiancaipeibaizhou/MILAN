@@ -325,6 +325,8 @@ class MILAN(nn.Module):
         def _spatial_encode_one_frame(data, dropedge_p):
             x, edge_index, edge_attr = data.x, data.edge_index, data.edge_attr
             batch = data.batch if hasattr(data, "batch") else None
+            x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+            edge_attr = torch.nan_to_num(edge_attr, nan=0.0, posinf=0.0, neginf=0.0)
 
             if hasattr(data, "n_id"):
                 frame_global_ids = data.n_id
@@ -339,6 +341,7 @@ class MILAN(nn.Module):
                         edge_index, p=float(dropedge_p), force_undirected=False
                     )
                     edge_attr_d = edge_attr[edge_mask]
+                    edge_attr_d = torch.nan_to_num(edge_attr_d, nan=0.0, posinf=0.0, neginf=0.0)
                 else:
                     edge_index_d = edge_index
                     edge_attr_d = edge_attr
@@ -432,42 +435,13 @@ class MILAN(nn.Module):
             # 5. [Paper Logic] 对比学习
             # 仅在训练阶段，且只对中间帧计算（节省显存）
             if self.training and t == self.seq_len // 2:
-                data_mid = graphs[t]
-
-                if abs(self.cl_view1_dropedge_p - self.dropedge_p) < 1e-12:
-                    edge_feat_v1 = spatial_edge_feats[t]
-                    mask_v1 = edge_masks[t]
-                else:
-                    _, edge_feat_v1, _, mask_v1, _ = _spatial_encode_one_frame(
-                        data_mid, dropedge_p=self.cl_view1_dropedge_p
-                    )
-
-                _, edge_feat_v2, _, mask_v2, _ = _spatial_encode_one_frame(
-                    data_mid, dropedge_p=self.cl_view2_dropedge_p
-                )
-
-                if (mask_v1 is not None) and (mask_v2 is not None):
-                    inter = mask_v1 & mask_v2
-                    if bool(inter.any()):
-                        idx_full = torch.nonzero(inter, as_tuple=False).view(-1)
-                        map1 = torch.cumsum(mask_v1.to(torch.int64), dim=0) - 1
-                        map2 = torch.cumsum(mask_v2.to(torch.int64), dim=0) - 1
-                        idx1 = map1[idx_full]
-                        idx2 = map2[idx_full]
-                        edge_feat_anchor = edge_feat_v1[idx1]
-                        edge_feat_pos = edge_feat_v2[idx2]
-                    else:
-                        edge_feat_anchor = None
-                        edge_feat_pos = None
-                else:
-                    edge_feat_anchor = None
-                    edge_feat_pos = None
-
-                if (edge_feat_anchor is not None) and (edge_feat_anchor.size(0) > 0):
+                edge_feat_anchor = spatial_edge_feats[t]
+                if edge_feat_anchor is not None and edge_feat_anchor.size(0) > 0:
                     if edge_feat_anchor.size(0) > self.max_cl_edges:
                         perm = torch.randperm(edge_feat_anchor.size(0), device=device)[: self.max_cl_edges]
                         edge_feat_anchor = edge_feat_anchor[perm]
-                        edge_feat_pos = edge_feat_pos[perm]
+
+                    edge_feat_pos = edge_feat_anchor + torch.randn_like(edge_feat_anchor) * 0.1
 
                     z1 = self.proj_head(edge_feat_anchor)
                     z2 = self.proj_head(edge_feat_pos)

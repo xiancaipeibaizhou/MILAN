@@ -13,7 +13,6 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-from torch.cuda.amp import autocast, GradScaler
 
 # Sklearn imports
 from sklearn.metrics import recall_score, f1_score, roc_auc_score, precision_score, confusion_matrix
@@ -25,10 +24,24 @@ from torch.utils.data import Dataset
 # 引入模型 (确保 network_dynamic.py 在同级目录)
 from model import MILAN
 from hparams_a3 import resolve_hparams
+from analys import (
+    _attack_best_threshold,
+    _collect_attack_scores,
+    evaluate_comprehensive,
+    evaluate_comprehensive_with_threshold,
+)
 
 # ==========================================
 # 1. 核心 Utils (直接内置，确保逻辑正确)
 # ==========================================
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 def _as_sequence_batch(batch):
     """处理 DataLoader collate 后的数据结构"""
@@ -238,160 +251,6 @@ def _save_confusion_matrix_png(cm, class_names, title, save_path):
 # 2. 评估与训练逻辑
 # ==========================================
 
-def _forward_compatible(model, batched_seq):
-    try:
-        return model(graphs=batched_seq)
-    except TypeError:
-        try:
-            return model(batched_seq)
-        except TypeError:
-            return model(batched_seq, len(batched_seq))
-
-def evaluate_binary(model, dataloader, device):
-    if dataloader is None or len(dataloader) == 0:
-        return 0.0, 0.0, 0.0, 0.0, 0.5, [], [], []
-
-    model.eval()
-    all_labels, all_preds, all_probs = [], [], []
-
-    with torch.no_grad():
-        for batch in dataloader:
-            seq_batch = _as_sequence_batch(batch)
-            for graphs in seq_batch:
-                graphs = [g.to(device) for g in graphs]
-                out = _forward_compatible(model, graphs)
-                preds = out[0] if isinstance(out, tuple) else out
-                
-                # 取最后一个时间步
-                logits = preds[-1]
-                labels = graphs[-1].edge_labels.to(device)
-                probs = torch.softmax(logits, dim=1)
-                
-                # 存概率，暂时不生成预测
-                all_labels.extend(labels.cpu().numpy())
-                all_probs.extend(probs[:, 1].cpu().numpy()) # 正类概率
-
-    if len(all_labels) == 0: return 0.0, 0.0, 0.0, 0.0, 0.5, [], [], []
-
-    y_true = np.array(all_labels)
-    y_score = np.array(all_probs)
-    
-    # 1. 计算 AUC
-    try:
-        auc = roc_auc_score(y_true, y_score)
-    except:
-        auc = 0.5
-
-    # 2. 动态寻找最佳 F1 的阈值 (Best Threshold)
-    # 这在不平衡数据集中是标准操作
-    from sklearn.metrics import precision_recall_curve
-    precisions, recalls, thresholds = precision_recall_curve(y_true, y_score)
-    
-    # 计算每个阈值下的 F1
-    f1_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-8)
-    best_idx = np.argmax(f1_scores)
-    best_threshold = thresholds[best_idx]
-    
-    # 3. 使用最佳阈值生成预测
-    y_pred = (y_score >= best_threshold).astype(int)
-    
-    acc = (y_pred == y_true).mean()
-    prec = precision_score(y_true, y_pred, zero_division=0)
-    rec = recall_score(y_true, y_pred, zero_division=0)
-    f1 = f1_score(y_true, y_pred, zero_division=0)
-    
-    print(f"DEBUG: Best Threshold found: {best_threshold:.4f}")
-
-    return acc, prec, rec, f1, auc, y_true, y_pred, y_score
-
-def evaluate_multiclass(model, dataloader, device, class_names):
-    """
-    修正版评估函数：基于混淆矩阵严格计算各项指标
-    """
-    if dataloader is None or len(dataloader) == 0:
-        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, [], []
-
-    model.eval()
-    all_labels, all_preds, all_probs = [], [], []
-    
-    # 自动寻找 Normal 和 Attack 的索引
-    # 默认假设：0 是 Normal, 1 是 Attack
-    # 如果你的 LabelEncoder 顺序不同，这里会自动调整
-    normal_idx = 0
-    attack_idx = 1
-    
-    for idx, name in enumerate(class_names):
-        if 'normal' in str(name).lower() or 'benign' in str(name).lower():
-            normal_idx = idx
-        else:
-            attack_idx = idx # 剩下的那个就是 Attack
-            
-    with torch.no_grad():
-        # 使用 tqdm 显示进度
-        for batched_seq in tqdm(dataloader, desc="Evaluating", unit="batch"):
-            batched_seq = [g.to(device) for g in batched_seq]
-            out = _forward_compatible(model, batched_seq)
-            preds = out[0] if isinstance(out, tuple) else out
-            
-            # 获取最后一帧的预测
-            logits = preds[-1]
-            probs = torch.softmax(logits, dim=1)
-            pred_cls = torch.argmax(probs, dim=1)
-            labels = batched_seq[-1].edge_labels
-            
-            all_labels.extend(labels.cpu().numpy())
-            all_preds.extend(pred_cls.cpu().numpy())
-            # 如果是二分类，取 Attack 类的概率计算 AUC
-            if probs.shape[1] == 2:
-                all_probs.extend(probs[:, attack_idx].cpu().numpy())
-            else:
-                all_probs.extend(probs.cpu().numpy())
-
-    if len(all_labels) == 0: return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, [], []
-
-    y_true = np.array(all_labels)
-    y_pred = np.array(all_preds)
-    y_probs = np.array(all_probs)
-    
-    # --- 1. 基础指标 ---
-    acc = (y_pred == y_true).mean()
-    
-    # --- 2. 基于混淆矩阵的严格计算 (修复核心) ---
-    # labels=[normal_idx, attack_idx] 确保 TN 在左上角 (0,0)
-    cm = confusion_matrix(y_true, y_pred, labels=[normal_idx, attack_idx])
-    tn, fp, fn, tp = cm.ravel()
-    
-    # 打印一下矩阵计数，方便调试 (可选)
-    # print(f"DEBUG Eval: TN={tn}, FP={fp}, FN={fn}, TP={tp}")
-
-    # Precision (精确率): 报出的攻击中有多少是真的
-    prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    
-    # Recall (召回率): 真实的攻击中有多少被抓到了
-    rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    
-    # F1 Score
-    f1 = 2 * (prec * rec) / (prec + rec) if (prec + rec) > 0 else 0.0
-    
-    # FAR (误报率): 正常样本被误报为攻击的比例
-    far = fp / (fp + tn) if (fp + tn) > 0 else 0.0
-    
-    # ASA (Anomaly Set Accuracy): 
-    # 定义：在所有异常样本中，分类正确的比例。这在二分类中等同于 Recall (TP / (TP+FN))
-    asa = rec
-
-    # --- 3. AUC ---
-    try:
-        if len(class_names) == 2:
-            auc = roc_auc_score(y_true, y_probs)
-        else:
-            auc = roc_auc_score(y_true, y_probs, multi_class='ovr', average='macro')
-    except Exception as e:
-        print(f"Warning: AUC calc failed: {e}")
-        auc = 0.5
-
-    return acc, prec, rec, f1, far, auc, asa, y_true, y_pred
-
 def train_loop(
     model,
     train_loader,
@@ -407,8 +266,6 @@ def train_loop(
     accum_steps=1,
 ):
     accum_steps = max(1, int(accum_steps))
-
-    scaler = GradScaler(enabled=(device.type == 'cuda'))
     model.train()
 
     print(f"Start Training (Total Epochs: {num_epochs})...")
@@ -421,14 +278,13 @@ def train_loop(
         pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs}', unit='batch')
 
         for step, batched_seq in enumerate(pbar):
-            with autocast(enabled=(device.type == 'cuda')):
-                batched_seq = [g.to(device, non_blocking=True) for g in batched_seq]
-                preds = model(graphs=batched_seq, seq_len=len(batched_seq))
-                target = batched_seq[-1].edge_labels
-                loss_val = criterion(preds[-1], target)
-                loss_val = loss_val / accum_steps
+            batched_seq = [g.to(device, non_blocking=True) for g in batched_seq]
+            preds = model(graphs=batched_seq, seq_len=len(batched_seq))
+            target = batched_seq[-1].edge_labels
+            loss_val = criterion(preds[-1], target)
+            loss_val = loss_val / accum_steps
 
-            scaler.scale(loss_val).backward()
+            loss_val.backward()
 
             current_loss = float(loss_val.item()) * float(accum_steps)
             total_loss += current_loss
@@ -436,10 +292,8 @@ def train_loop(
             pbar.set_postfix({'loss': f'{current_loss:.4f}'})
 
             if (step + 1) % accum_steps == 0 or (step + 1) == len(train_loader):
-                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0)
-                scaler.step(optimizer)
-                scaler.update()
+                optimizer.step()
                 optimizer.zero_grad()
 
         avg_loss = total_loss / max(1, batch_count)
@@ -451,8 +305,11 @@ def train_loop(
     print("\n" + "=" * 30)
     print("Training Completed. Starting Final Evaluation...")
     print("=" * 30)
-
-    acc, prec, rec, f1, far, auc, asa, y_true, y_pred = evaluate_multiclass(model, test_loader, device, class_names)
+    y_true_attack, y_score = _collect_attack_scores(model, test_loader, device, class_names)
+    best_thresh, _, _, _ = _attack_best_threshold(y_true_attack, y_score, max_far=0.03)
+    acc, prec, rec, f1, far, auc, asa, y_true, y_pred = evaluate_comprehensive_with_threshold(
+        model, test_loader, device, class_names, threshold=best_thresh
+    )
 
     print("\n" + "-" * 60)
     print(f"Final Results (Epoch {num_epochs}):")
@@ -597,83 +454,6 @@ def _build_graph_seq(df):
             seq.append(g)
     return seq
 
-def _binary_metrics_from_scores(y_true, y_score, threshold):
-    y_true = np.asarray(y_true, dtype=np.int64)
-    y_score = np.asarray(y_score, dtype=np.float64)
-    y_pred = (y_score >= float(threshold)).astype(np.int64)
-
-    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
-    if cm.size == 4:
-        tn, fp, fn, tp = cm.ravel()
-    else:
-        tn = fp = fn = tp = 0
-
-    far = fp / (fp + tn) if (fp + tn) > 0 else 0.0
-    asa = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1 = f1_score(y_true, y_pred, zero_division=0) if y_true.size > 0 else 0.0
-    return f1, far, asa, y_pred
-
-def _binary_best_threshold(y_true, y_score, max_far=0.03):
-    y_true = np.asarray(y_true, dtype=np.int64)
-    y_score = np.asarray(y_score, dtype=np.float64)
-    if y_true.size == 0:
-        return 0.5, 0.0, 0.0, 0.0
-
-    try:
-        from sklearn.metrics import precision_recall_curve
-    except Exception:
-        precision_recall_curve = None
-
-    candidates = None
-    if precision_recall_curve is not None:
-        precisions, recalls, thresholds = precision_recall_curve(y_true, y_score)
-        if thresholds is not None and len(thresholds) > 0:
-            candidates = thresholds
-
-    if candidates is None:
-        candidates = np.unique(np.quantile(y_score, np.linspace(0.0, 1.0, 101)))
-
-    best_th = 0.5
-    best_f1 = -1.0
-    best_far = 1.0
-    best_asa = -1.0
-    for th in np.asarray(candidates, dtype=np.float64):
-        f1, far, asa, _ = _binary_metrics_from_scores(y_true, y_score, float(th))
-        if far <= float(max_far):
-            if (asa > best_asa) or (asa == best_asa and f1 > best_f1):
-                best_asa = asa
-                best_f1 = f1
-                best_far = far
-                best_th = float(th)
-
-    if best_asa < 0.0:
-        for th in np.asarray(candidates, dtype=np.float64):
-            f1, far, asa, _ = _binary_metrics_from_scores(y_true, y_score, float(th))
-            if (asa > best_asa) or (asa == best_asa and f1 > best_f1):
-                best_asa = asa
-                best_f1 = f1
-                best_far = far
-                best_th = float(th)
-
-    return best_th, float(best_f1), float(best_far), float(best_asa)
-
-def _collect_binary_scores(model, dataloader, device):
-    model.eval()
-    all_labels = []
-    all_scores = []
-    with torch.no_grad():
-        for batched_seq in dataloader:
-            if not batched_seq:
-                continue
-            batched_seq = [g.to(device) for g in batched_seq]
-            out = model(graphs=batched_seq)
-            preds_seq = out[0] if isinstance(out, tuple) else out
-            logits = preds_seq[-1]
-            probs = torch.softmax(logits, dim=1)
-            all_labels.extend(batched_seq[-1].edge_labels.detach().cpu().numpy())
-            all_scores.extend(probs[:, 1].detach().cpu().numpy())
-    return np.asarray(all_labels, dtype=np.int64), np.asarray(all_scores, dtype=np.float64)
-
 def _compute_sqrt_class_weights_from_graphs(graph_seq, num_classes):
     counts = np.zeros(num_classes, dtype=np.float64)
     for g in graph_seq:
@@ -795,7 +575,6 @@ def run_one_experiment(group, h, train_seq, val_seq, test_seq, edge_dim, device)
     best_metric = -float("inf")
     no_improve_epochs = 0
 
-    scaler = GradScaler(enabled=(device.type == "cuda"))
     num_train_steps = max(1, len(train_loader))
     num_opt_steps_per_epoch = max(1, (num_train_steps + accum_steps - 1) // accum_steps)
     warmup_total_steps = int(warmup_epochs) * int(num_opt_steps_per_epoch)
@@ -814,27 +593,26 @@ def run_one_experiment(group, h, train_seq, val_seq, test_seq, edge_dim, device)
                 continue
             batched_seq = [g.to(device) for g in batched_seq]
 
-            with autocast(enabled=(device.type == "cuda")):
-                out = model(graphs=batched_seq)
-                all_preds, cl_loss = out if isinstance(out, tuple) else (out, None)
-                last_frame_pred = all_preds[-1]
-                last_frame_labels = batched_seq[-1].edge_labels
-                last_mask = None
-                if hasattr(model, "_last_edge_masks"):
-                    masks = getattr(model, "_last_edge_masks", None)
-                    if isinstance(masks, (list, tuple)) and len(masks) > 0:
-                        last_mask = masks[-1]
-                if last_mask is not None:
-                    last_frame_labels = last_frame_labels[last_mask]
+            out = model(graphs=batched_seq)
+            all_preds, cl_loss = out if isinstance(out, tuple) else (out, None)
+            last_frame_pred = all_preds[-1]
+            last_frame_labels = batched_seq[-1].edge_labels
+            last_mask = None
+            if hasattr(model, "_last_edge_masks"):
+                masks = getattr(model, "_last_edge_masks", None)
+                if isinstance(masks, (list, tuple)) and len(masks) > 0:
+                    last_mask = masks[-1]
+            if last_mask is not None:
+                last_frame_labels = last_frame_labels[last_mask]
 
-                main_loss = criterion(last_frame_pred, last_frame_labels)
-                if torch.is_tensor(cl_loss):
-                    full_loss = main_loss + cl_loss_weight * cl_loss
-                else:
-                    full_loss = main_loss
-                loss = full_loss / float(accum_steps)
+            main_loss = criterion(last_frame_pred, last_frame_labels)
+            if torch.is_tensor(cl_loss):
+                full_loss = main_loss + cl_loss_weight * cl_loss
+            else:
+                full_loss = main_loss
+            loss = full_loss / float(accum_steps)
 
-            scaler.scale(loss).backward()
+            loss.backward()
 
             total_loss += float(full_loss.detach().item())
             if torch.is_tensor(cl_loss):
@@ -851,10 +629,8 @@ def run_one_experiment(group, h, train_seq, val_seq, test_seq, edge_dim, device)
                     progress = float(epoch) + float(step + 1) / float(num_train_steps)
                     scheduler.step(progress - float(warmup_epochs))
 
-                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0)
-                scaler.step(optimizer)
-                scaler.update()
+                optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 global_opt_step += 1
 
@@ -881,7 +657,7 @@ def run_one_experiment(group, h, train_seq, val_seq, test_seq, edge_dim, device)
                 val_steps += 1
 
         avg_val_loss = total_val_loss / max(1, val_steps)
-        val_acc, val_prec, val_rec, val_f1, val_far, val_auc, val_asa, _, _ = evaluate_multiclass(
+        val_acc, val_prec, val_rec, val_f1, val_far, val_auc, val_asa = evaluate_comprehensive(
             model, val_loader, device, class_names
         )
 
@@ -927,23 +703,17 @@ def run_one_experiment(group, h, train_seq, val_seq, test_seq, edge_dim, device)
             print(f"[{group_tag}] Failed to load checkpoint. Using current weights. Error: {e}", flush=True)
 
     print(f"\n[{group_tag}] === Post-Training Threshold Optimization ===", flush=True)
-    y_true, y_score = _collect_binary_scores(model, test_loader, device)
-    best_thresh, best_f1, best_far, best_asa = _binary_best_threshold(y_true, y_score, max_far=target_far)
+    y_true_attack, y_score = _collect_attack_scores(model, test_loader, device, class_names)
+    best_thresh, best_f1, best_far, best_asa = _attack_best_threshold(y_true_attack, y_score, max_far=target_far)
     print(
         f"[{group_tag}] Best Threshold -> th={best_thresh:.4f}, F1={best_f1:.4f}, FAR={best_far:.4f}, ASA={best_asa:.4f}",
         flush=True,
     )
 
     print(f"\n[{group_tag}] Best Strategy: Threshold = {best_thresh}", flush=True)
-
-    f1, far, asa, y_pred = _binary_metrics_from_scores(y_true, y_score, best_thresh)
-    try:
-        auc = float(roc_auc_score(y_true, y_score)) if y_true.size > 0 else 0.5
-    except Exception:
-        auc = 0.5
-    acc = float((y_pred == y_true).mean()) if y_true.size > 0 else 0.0
-    prec = float(precision_score(y_true, y_pred, zero_division=0)) if y_true.size > 0 else 0.0
-    rec = float(recall_score(y_true, y_pred, zero_division=0)) if y_true.size > 0 else 0.0
+    acc, prec, rec, f1, far, auc, asa, y_true, y_pred = evaluate_comprehensive_with_threshold(
+        model, test_loader, device, class_names, threshold=best_thresh
+    )
     print(
         f"[{group_tag}] Final Test -> ACC: {acc:.4f}, PREC: {prec:.4f}, Rec: {rec:.4f}, "
         f"F1: {f1:.4f}, AUC: {auc:.4f}, ASA: {asa:.4f}",
@@ -958,14 +728,20 @@ def run_one_experiment(group, h, train_seq, val_seq, test_seq, edge_dim, device)
         f"png/2012/FINAL_CM_{run_tag}.png",
     )
     print(f"[{group_tag}] Confusion Matrix Saved.", flush=True)
+
+    log_file = "experiment_results.csv"
+    file_exists = os.path.isfile(log_file)
+    with open(log_file, "a", encoding="utf-8") as f:
+        if not file_exists:
+            f.write("Dataset,Group,SeqLen,Hidden,Heads,DropEdge,Threshold,F1,ASA,FAR,AUC\n")
+        f.write(
+            f"ISCX2012,{group_tag},{seq_len},{hidden},{heads},{dropedge_p},{best_thresh:.6f},"
+            f"{f1:.4f},{asa:.4f},{far:.4f},{auc:.4f}\n"
+        )
     print(f"[{group_tag}] Total Time: {time.time() - start_time:.2f}s", flush=True)
 
 def main():
-    seed = int(os.getenv("SEED", "42"))
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    set_seed(int(os.getenv("SEED", "42")))
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(f"Using Device: {device}", flush=True)
