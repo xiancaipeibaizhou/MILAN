@@ -220,17 +220,22 @@ def _attack_best_threshold(y_true_attack, y_score, max_far=0.01):
     best_f1 = -1.0
     best_far = 1.0
     best_asa = -1.0
+    best_score = -1.0
     for th in candidates:
         f1, far, asa = _attack_metrics_from_scores(y_true_attack, y_score, float(th))
         if far <= float(max_far):
-            if (asa > best_asa) or (asa == best_asa and f1 > best_f1):
+            current_score = float(f1) + float(asa)
+            if (current_score > best_score) or (current_score == best_score and float(far) < float(best_far)):
                 best_th, best_f1, best_far, best_asa = float(th), float(f1), float(far), float(asa)
+                best_score = float(current_score)
 
-    if best_asa < 0.0:
+    if best_score < 0.0:
         for th in candidates:
             f1, far, asa = _attack_metrics_from_scores(y_true_attack, y_score, float(th))
-            if (asa > best_asa) or (asa == best_asa and f1 > best_f1):
+            current_score = float(f1) + float(asa)
+            if (current_score > best_score) or (current_score == best_score and float(far) < float(best_far)):
                 best_th, best_f1, best_far, best_asa = float(th), float(f1), float(far), float(asa)
+                best_score = float(current_score)
 
     return best_th, best_f1, best_far, best_asa
 

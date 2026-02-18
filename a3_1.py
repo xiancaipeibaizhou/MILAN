@@ -469,13 +469,14 @@ def run_one_experiment(
             print(f"[{group_tag}] ⚠️ Failed to load best model: {e}", flush=True)
 
     print(f"\n[{group_tag}] === Post-Training Threshold Optimization ===", flush=True)
-    y_true_attack, y_score = _collect_attack_scores(model, test_loader, device, class_names)
-    best_thresh, best_f1, best_far, best_asa = _attack_best_threshold(y_true_attack, y_score, max_far=target_far)
+    y_true_val, y_score_val = _collect_attack_scores(model, val_loader, device, class_names)
+    best_thresh, val_f1, val_far, val_asa = _attack_best_threshold(y_true_val, y_score_val, max_far=target_far)
     print(
-        f"[{group_tag}] Best Threshold -> th={best_thresh:.4f}, F1={best_f1:.4f}, FAR={best_far:.4f}, ASA={best_asa:.4f}",
+        f"[{group_tag}] Best Threshold found on VAL -> th={best_thresh:.4f}, Val F1={val_f1:.4f}, Val FAR={val_far:.4f}, Val ASA={val_asa:.4f}",
         flush=True,
     )
 
+    print(f"\n[{group_tag}] === Final Evaluation on Test Set ===", flush=True)
     final_acc, final_prec, final_rec, final_f1, final_far, final_auc, final_asa, final_labels, final_preds = evaluate_comprehensive_with_threshold(
         model, test_loader, device, class_names, threshold=best_thresh
     )
@@ -724,7 +725,7 @@ def main():
             full_counts[idx] = count
     weights_cpu = 1.0 / (torch.sqrt(torch.tensor(full_counts, dtype=torch.float)) + 1.0)
 
-    max_weight_limit = weights_cpu[0] * 20.0
+    max_weight_limit = weights_cpu.min() * 20.0
     weights_cpu = torch.clamp(weights_cpu, max=max_weight_limit)
 
     weights_cpu = weights_cpu / weights_cpu.sum() * len(class_names)

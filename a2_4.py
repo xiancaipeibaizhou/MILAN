@@ -522,14 +522,14 @@ def run_one_experiment(
     )
 
     print(f"\n[{group_tag}] === Post-Training Threshold Optimization ===", flush=True)
-    y_true_attack, y_score = _collect_attack_scores(model, test_loader, device, class_names)
-    optimal_thresh, best_f1, best_far, best_asa = _attack_best_threshold(y_true_attack, y_score, max_far=target_far)
+    y_true_val, y_score_val = _collect_attack_scores(model, val_loader, device, class_names)
+    optimal_thresh, val_f1, val_far, val_asa = _attack_best_threshold(y_true_val, y_score_val, max_far=target_far)
     print(
-        f"[{group_tag}] Best Threshold -> th={optimal_thresh:.4f}, F1={best_f1:.4f}, FAR={best_far:.4f}, ASA={best_asa:.4f}",
+        f"[{group_tag}] Best Threshold found on VAL -> th={optimal_thresh:.4f}, Val F1={val_f1:.4f}, Val FAR={val_far:.4f}, Val ASA={val_asa:.4f}",
         flush=True,
     )
 
-    print(f"\n[{group_tag}] === Re-Evaluating with Best Threshold ===", flush=True)
+    print(f"\n[{group_tag}] === Final Evaluation on Test Set ===", flush=True)
     opt_acc, opt_prec, opt_rec, opt_f1, opt_far, opt_auc, opt_asa, final_labels, final_preds = evaluate_comprehensive_with_threshold(
         model, test_loader, device, class_names, threshold=optimal_thresh
     )
