@@ -12,9 +12,9 @@ except Exception:
 def _infer_normal_indices(class_names):
     normal_indices = []
     for idx, name in enumerate(class_names):
-        name_lower = str(name).lower()
+        name_lower = str(name).lower().strip()
         token = "".join(ch for ch in name_lower if ch.isalnum())
-        if ("benign" in token) or (token == "normal"):
+        if ("benign" in name_lower) or (token == "normal") or (token in {"nonvpn", "nontor"}):
             normal_indices.append(idx)
     return normal_indices
 
@@ -270,7 +270,7 @@ def _attack_best_threshold(y_true_attack, y_score, max_far=0.01):
 
     return best_th, best_f1, best_far, best_asa
 
-def evaluate_comprehensive_with_threshold(model, dataloader, device, class_names, threshold):
+def evaluate_comprehensive_with_threshold(model, dataloader, device, class_names, threshold, average="macro"):
     model.eval()
     all_labels = []
     all_preds = []
@@ -283,7 +283,7 @@ def evaluate_comprehensive_with_threshold(model, dataloader, device, class_names
         for batched_seq in dataloader:
             if not batched_seq:
                 continue
-            batched_seq = [g.to(device) for g in batched_seq]
+            batched_seq = [g.to(device, non_blocking=True) for g in batched_seq]
 
             preds_seq = _forward_logits_seq(model, batched_seq)
             logits = preds_seq[-1]
@@ -312,9 +312,9 @@ def evaluate_comprehensive_with_threshold(model, dataloader, device, class_names
     y_probs = np.asarray(all_probs, dtype=np.float64)
 
     acc = float((y_pred == y_true).mean())
-    prec = float(precision_score(y_true, y_pred, average='weighted', zero_division=0))
-    rec = float(recall_score(y_true, y_pred, average='weighted', zero_division=0))
-    f1 = float(f1_score(y_true, y_pred, average='weighted', zero_division=0))
+    prec = float(precision_score(y_true, y_pred, average=str(average), zero_division=0))
+    rec = float(recall_score(y_true, y_pred, average=str(average), zero_division=0))
+    f1 = float(f1_score(y_true, y_pred, average=str(average), zero_division=0))
 
     is_true_normal = np.isin(y_true, np.asarray(normal_indices, dtype=np.int64))
     is_pred_normal = np.isin(y_pred, np.asarray(normal_indices, dtype=np.int64))

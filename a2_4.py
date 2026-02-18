@@ -506,10 +506,10 @@ def run_one_experiment(
         print(f"[{group_tag}] Warning: No best model file found! Using last epoch weights.", flush=True)
 
     final_acc, final_prec, final_rec, final_f1, final_far, final_auc, final_asa = evaluate_comprehensive(
-        model, test_loader, device, class_names
+        model, test_loader, device, class_names, average="macro"
     )
     print(
-        f"[{group_tag}] Final Test -> ACC: {final_acc:.4f}, PREC: {final_prec:.4f}, F1: {final_f1:.4f}, "
+        f"[{group_tag}] Final Test -> ACC: {final_acc:.4f}, PREC: {final_prec:.4f}, F1(macro): {final_f1:.4f}, "
         f"Rec: {final_rec:.4f}, FAR: {final_far:.4f}, AUC: {final_auc:.4f}, ASA: {final_asa:.4f}",
         flush=True,
     )
@@ -524,7 +524,7 @@ def run_one_experiment(
 
     print(f"\n[{group_tag}] === Final Evaluation on Test Set ===", flush=True)
     opt_acc, opt_prec, opt_rec, opt_f1, opt_far, opt_auc, opt_asa, final_labels, final_preds = evaluate_comprehensive_with_threshold(
-        model, test_loader, device, class_names, threshold=optimal_thresh
+        model, test_loader, device, class_names, threshold=optimal_thresh, average="macro"
     )
     present = np.unique(np.asarray(final_labels, dtype=np.int64))
     missing = sorted(list(set(range(len(class_names))) - set(present.tolist())))
@@ -540,7 +540,7 @@ def run_one_experiment(
     print(f"[{group_tag}] Final Labels Counts -> " + ", ".join(nonzero_pairs), flush=True)
     print(
         f"[{group_tag}] Optimal Threshold Test -> ACC: {opt_acc:.4f}, PREC: {opt_prec:.4f}, "
-        f"F1: {opt_f1:.4f}, Rec: {opt_rec:.4f}, FAR: {opt_far:.4f}, "
+        f"F1(macro): {opt_f1:.4f}, Rec: {opt_rec:.4f}, FAR: {opt_far:.4f}, "
         f"AUC: {opt_auc:.4f}, ASA: {opt_asa:.4f}",
         flush=True,
     )

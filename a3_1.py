@@ -475,7 +475,7 @@ def run_one_experiment(
 
     print(f"\n[{group_tag}] === Final Evaluation on Test Set ===", flush=True)
     final_acc, final_prec, final_rec, final_f1, final_far, final_auc, final_asa, final_labels, final_preds = evaluate_comprehensive_with_threshold(
-        model, test_loader, device, class_names, threshold=best_thresh
+        model, test_loader, device, class_names, threshold=best_thresh, average="macro"
     )
 
     present = np.unique(np.asarray(final_labels, dtype=np.int64))
@@ -492,7 +492,7 @@ def run_one_experiment(
     print(f"[{group_tag}] Final Labels Counts -> " + ", ".join(nonzero_pairs), flush=True)
     print(
         f"[{group_tag}] Final Test -> ACC: {final_acc:.4f}, PREC: {final_prec:.4f}, Rec: {final_rec:.4f}, "
-        f"F1: {final_f1:.4f}, AUC: {final_auc:.4f}, ASA: {final_asa:.4f}",
+        f"F1(macro): {final_f1:.4f}, AUC: {final_auc:.4f}, ASA: {final_asa:.4f}",
         flush=True,
     )
 

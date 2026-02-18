@@ -663,11 +663,11 @@ def run_one_experiment(group, h, train_seq, val_seq, test_seq, edge_dim, device)
 
     print(f"\n[{group_tag}] Best Strategy: Threshold = {best_thresh}", flush=True)
     acc, prec, rec, f1, far, auc, asa, y_true, y_pred = evaluate_comprehensive_with_threshold(
-        model, test_loader, device, class_names, threshold=best_thresh
+        model, test_loader, device, class_names, threshold=best_thresh, average="macro"
     )
     print(
         f"[{group_tag}] Final Test -> ACC: {acc:.4f}, PREC: {prec:.4f}, Rec: {rec:.4f}, "
-        f"F1: {f1:.4f}, AUC: {auc:.4f}, ASA: {asa:.4f}",
+        f"F1(macro): {f1:.4f}, AUC: {auc:.4f}, ASA: {asa:.4f}",
         flush=True,
     )
 
