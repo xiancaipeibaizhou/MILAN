@@ -29,8 +29,8 @@ try:
         _attack_best_threshold,
         _collect_attack_scores,
         FocalLoss,
-        evaluate_comprehensive,
-        evaluate_comprehensive_with_threshold,
+        evaluate_comprehensive_v2,
+        evaluate_comprehensive_with_threshold_v2,
         evaluate_with_threshold,
     )
     from model import MILAN
@@ -441,14 +441,15 @@ def run_one_experiment(
             val_acc,
             val_prec,
             val_rec,
-            val_f1,
-            val_far,
+            val_f1_macro,
+            val_f1_weighted,
             val_auc,
             val_asa,
+            val_far,
             y_true_val,
             y_pred_val,
             _y_probs_val,
-        ) = evaluate_comprehensive(
+        ) = evaluate_comprehensive_v2(
             model,
             val_loader,
             device,
@@ -458,10 +459,7 @@ def run_one_experiment(
             criterion=criterion,
             return_loss=True,
         )
-        try:
-            val_f1_weighted = float(f1_score(y_true_val, y_pred_val, average="weighted", zero_division=0))
-        except Exception:
-            val_f1_weighted = 0.0
+        val_f1 = val_f1_macro
 
         current_lr = optimizer.param_groups[0]["lr"]
         print(
@@ -526,9 +524,19 @@ def run_one_experiment(
     )
 
     print(f"\n[{group_tag}] === Final Evaluation on Test Set ===", flush=True)
-    final_acc, final_prec, final_rec, final_f1, final_far, final_auc, final_asa, final_labels, final_preds = evaluate_comprehensive_with_threshold(
-        model, test_loader, device, class_names, threshold=best_thresh, average="macro"
-    )
+    (
+        final_acc,
+        final_prec,
+        final_rec,
+        final_f1_macro,
+        final_f1_weighted,
+        final_auc,
+        final_asa,
+        final_far,
+        final_labels,
+        final_preds,
+    ) = evaluate_comprehensive_with_threshold_v2(model, test_loader, device, class_names, threshold=best_thresh, average="macro")
+    final_f1 = final_f1_macro
 
     present = np.unique(np.asarray(final_labels, dtype=np.int64))
     missing = sorted(list(set(range(len(class_names))) - set(present.tolist())))
@@ -544,7 +552,8 @@ def run_one_experiment(
     print(f"[{group_tag}] Final Labels Counts -> " + ", ".join(nonzero_pairs), flush=True)
     print(
         f"[{group_tag}] Final Test -> ACC: {final_acc:.4f}, PREC: {final_prec:.4f}, Rec: {final_rec:.4f}, "
-        f"F1(macro): {final_f1:.4f}, AUC: {final_auc:.4f}, ASA: {final_asa:.4f}",
+        f"F1(macro): {final_f1:.4f}, F1(weighted): {final_f1_weighted:.4f}, "
+        f"AUC: {final_auc:.4f}, ASA: {final_asa:.4f}, FAR: {final_far:.4f}",
         flush=True,
     )
 

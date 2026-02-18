@@ -28,8 +28,8 @@ from hparams_a3 import resolve_hparams
 from analys import (
     _attack_best_threshold,
     _collect_attack_scores,
-    evaluate_comprehensive,
-    evaluate_comprehensive_with_threshold,
+    evaluate_comprehensive_v2,
+    evaluate_comprehensive_with_threshold_v2,
 )
 
 # ==========================================
@@ -589,13 +589,14 @@ def run_one_experiment(group, h, train_seq, val_seq, test_seq, edge_dim, device)
             _val_prec,
             _val_rec,
             val_f1_macro,
-            _val_far,
+            _val_f1_weighted,
             _val_auc,
             val_asa,
+            _val_far,
             y_true_val,
             y_pred_val,
             _y_probs_val,
-        ) = evaluate_comprehensive(
+        ) = evaluate_comprehensive_v2(
             model,
             val_loader,
             device,
@@ -666,12 +667,23 @@ def run_one_experiment(group, h, train_seq, val_seq, test_seq, edge_dim, device)
     )
 
     print(f"\n[{group_tag}] Best Strategy: Threshold = {best_thresh}", flush=True)
-    acc, prec, rec, f1, far, auc, asa, y_true, y_pred = evaluate_comprehensive_with_threshold(
-        model, test_loader, device, class_names, threshold=best_thresh, average="macro"
-    )
+    (
+        acc,
+        prec,
+        rec,
+        f1_macro,
+        f1_weighted,
+        auc,
+        asa,
+        far,
+        y_true,
+        y_pred,
+    ) = evaluate_comprehensive_with_threshold_v2(model, test_loader, device, class_names, threshold=best_thresh, average="macro")
+    f1 = f1_macro
     print(
         f"[{group_tag}] Final Test -> ACC: {acc:.4f}, PREC: {prec:.4f}, Rec: {rec:.4f}, "
-        f"F1(macro): {f1:.4f}, AUC: {auc:.4f}, ASA: {asa:.4f}",
+        f"F1(macro): {f1:.4f}, F1(weighted): {f1_weighted:.4f}, "
+        f"AUC: {auc:.4f}, ASA: {asa:.4f}, FAR: {far:.4f}",
         flush=True,
     )
 

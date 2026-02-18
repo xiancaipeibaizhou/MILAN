@@ -16,6 +16,8 @@ def _infer_normal_indices(class_names):
         token = "".join(ch for ch in name_lower if ch.isalnum())
         if ("benign" in name_lower) or (token == "normal") or (token in {"nonvpn", "nontor"}):
             normal_indices.append(idx)
+    if len(normal_indices) == 0 and len(class_names) > 0:
+        normal_indices = [0]
     return normal_indices
 
 def _auc_ovr_macro(y_true, y_probs, present_labels):
@@ -46,6 +48,42 @@ def _forward_logits_seq(model, graphs):
         out = model(graphs=graphs)
     preds_seq = out[0] if isinstance(out, tuple) else out
     return preds_seq
+
+def _compute_metrics_8(y_true, y_pred, y_probs, class_names, normal_indices, average):
+    y_true = np.asarray(y_true, dtype=np.int64)
+    y_pred = np.asarray(y_pred, dtype=np.int64)
+    y_probs = np.asarray(y_probs, dtype=np.float64)
+
+    acc = float((y_pred == y_true).mean()) if y_true.size > 0 else 0.0
+    prec = float(precision_score(y_true, y_pred, average=str(average), zero_division=0)) if y_true.size > 0 else 0.0
+    rec = float(recall_score(y_true, y_pred, average=str(average), zero_division=0)) if y_true.size > 0 else 0.0
+
+    f1_macro = float(f1_score(y_true, y_pred, average="macro", zero_division=0)) if y_true.size > 0 else 0.0
+    f1_weighted = float(f1_score(y_true, y_pred, average="weighted", zero_division=0)) if y_true.size > 0 else 0.0
+
+    is_true_normal = np.isin(y_true, np.asarray(normal_indices, dtype=np.int64))
+    is_pred_normal = np.isin(y_pred, np.asarray(normal_indices, dtype=np.int64))
+    fp = int(np.logical_and(is_true_normal, ~is_pred_normal).sum())
+    tn = int(np.logical_and(is_true_normal, is_pred_normal).sum())
+    far = float(fp / (fp + tn)) if (fp + tn) > 0 else 0.0
+
+    attack_mask = ~is_true_normal
+    asa = float((y_pred[attack_mask] == y_true[attack_mask]).mean()) if bool(attack_mask.any()) else 0.0
+
+    present_labels = np.unique(y_true)
+    try:
+        if y_probs.ndim != 2 or y_probs.shape[0] != y_true.shape[0]:
+            auc = 0.5
+        elif len(present_labels) < 2:
+            auc = 0.5
+        elif len(class_names) == 2 and y_probs.shape[1] >= 2:
+            auc = float(roc_auc_score(y_true, y_probs[:, 1]))
+        else:
+            auc = _auc_ovr_macro(y_true, y_probs, present_labels)
+    except Exception:
+        auc = 0.5
+
+    return acc, prec, rec, f1_macro, f1_weighted, float(auc), asa, far
 
 # ==========================================
 # 3. 评估辅助函数
@@ -93,54 +131,35 @@ def evaluate_comprehensive(
             all_probs.extend(probs.cpu().numpy())
 
     if len(all_labels) == 0:
+        y_true = np.asarray([], dtype=np.int64)
+        y_pred = np.asarray([], dtype=np.int64)
+        y_probs = np.asarray([])
+        base = (0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, y_true, y_pred)
+        avg_loss = 0.0
         if return_details and return_loss:
-            return 0, 0, 0, 0, 0, 0, 0, 0, np.asarray([], dtype=int), np.asarray([], dtype=int), np.asarray([])
+            return (avg_loss,) + base + (y_probs,)
         if return_details:
-            return 0, 0, 0, 0, 0, 0, 0, np.asarray([], dtype=int), np.asarray([], dtype=int), np.asarray([])
+            return base + (y_probs,)
         if return_loss:
-            return 0, 0, 0, 0, 0, 0, 0, 0
-        return 0, 0, 0, 0, 0, 0, 0
+            return (avg_loss,) + base
+        return base
 
     y_true = np.array(all_labels)
     y_pred = np.array(all_preds)
     y_probs = np.array(all_probs)
 
-    acc = (y_pred == y_true).mean()
-    prec = precision_score(y_true, y_pred, average=str(average), zero_division=0)
-    rec = recall_score(y_true, y_pred, average=str(average), zero_division=0)
-    f1 = f1_score(y_true, y_pred, average=str(average), zero_division=0)
-
-    is_true_normal = np.isin(y_true, normal_indices)
-    is_pred_normal = np.isin(y_pred, normal_indices)
-
-    fp = np.logical_and(is_true_normal, ~is_pred_normal).sum()
-    tn = np.logical_and(is_true_normal, is_pred_normal).sum()
-
-    far = fp / (fp + tn) if (fp + tn) > 0 else 0.0
-    attack_mask = ~is_true_normal
-    asa = (y_pred[attack_mask] == y_true[attack_mask]).mean() if attack_mask.any() else 0.0
-
-    present_labels = np.unique(y_true)
-    try:
-        if y_probs.ndim != 2 or y_probs.shape[0] != y_true.shape[0]:
-            auc = 0.5
-        elif len(present_labels) < 2:
-            auc = 0.5
-        elif len(class_names) == 2 and y_probs.shape[1] >= 2:
-            auc = float(roc_auc_score(y_true, y_probs[:, 1]))
-        else:
-            auc = _auc_ovr_macro(y_true, y_probs, present_labels)
-    except Exception:
-        auc = 0.5
-
     avg_loss = (loss_sum / max(1, loss_steps)) if bool(return_loss) else 0.0
+    acc, prec, rec, f1_macro, f1_weighted, auc, asa, far = _compute_metrics_8(
+        y_true, y_pred, y_probs, class_names, normal_indices, average
+    )
+    base = (acc, prec, rec, f1_macro, f1_weighted, auc, asa, far, y_true, y_pred)
     if return_details and return_loss:
-        return avg_loss, acc, prec, rec, f1, far, auc, asa, y_true, y_pred, y_probs
+        return (avg_loss,) + base + (y_probs,)
     if return_details:
-        return acc, prec, rec, f1, far, auc, asa, y_true, y_pred, y_probs
+        return base + (y_probs,)
     if return_loss:
-        return avg_loss, acc, prec, rec, f1, far, auc, asa
-    return acc, prec, rec, f1, far, auc, asa
+        return (avg_loss,) + base
+    return base
 
 def evaluate_with_threshold(model, dataloader, device, class_names, threshold=0.4):
     """
@@ -270,7 +289,9 @@ def _attack_best_threshold(y_true_attack, y_score, max_far=0.01):
 
     return best_th, best_f1, best_far, best_asa
 
-def evaluate_comprehensive_with_threshold(model, dataloader, device, class_names, threshold, average="macro"):
+def evaluate_comprehensive_with_threshold(
+    model, dataloader, device, class_names, threshold, average="macro"
+):
     model.eval()
     all_labels = []
     all_preds = []
@@ -305,40 +326,56 @@ def evaluate_comprehensive_with_threshold(model, dataloader, device, class_names
             all_probs.extend(probs.detach().cpu().numpy())
 
     if len(all_labels) == 0:
-        return 0, 0, 0, 0, 0, 0.5, 0, np.array([]), np.array([])
+        y_true = np.asarray([], dtype=np.int64)
+        y_pred = np.asarray([], dtype=np.int64)
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, y_true, y_pred
 
     y_true = np.asarray(all_labels, dtype=np.int64)
     y_pred = np.asarray(all_preds, dtype=np.int64)
     y_probs = np.asarray(all_probs, dtype=np.float64)
 
-    acc = float((y_pred == y_true).mean())
-    prec = float(precision_score(y_true, y_pred, average=str(average), zero_division=0))
-    rec = float(recall_score(y_true, y_pred, average=str(average), zero_division=0))
-    f1 = float(f1_score(y_true, y_pred, average=str(average), zero_division=0))
+    acc, prec, rec, f1_macro, f1_weighted, auc, asa, far = _compute_metrics_8(
+        y_true, y_pred, y_probs, class_names, normal_indices, average
+    )
+    return acc, prec, rec, f1_macro, f1_weighted, auc, asa, far, y_true, y_pred
 
-    is_true_normal = np.isin(y_true, np.asarray(normal_indices, dtype=np.int64))
-    is_pred_normal = np.isin(y_pred, np.asarray(normal_indices, dtype=np.int64))
-    fp = np.logical_and(is_true_normal, ~is_pred_normal).sum()
-    tn = np.logical_and(is_true_normal, is_pred_normal).sum()
-    far = float(fp / (fp + tn)) if (fp + tn) > 0 else 0.0
+def evaluate_comprehensive_v2(
+    model,
+    dataloader,
+    device,
+    class_names,
+    average="macro",
+    return_details=False,
+    criterion=None,
+    return_loss=False,
+):
+    return evaluate_comprehensive(
+        model,
+        dataloader,
+        device,
+        class_names,
+        average=average,
+        return_details=return_details,
+        criterion=criterion,
+        return_loss=return_loss,
+    )
 
-    attack_mask = ~is_true_normal
-    asa = float((y_pred[attack_mask] == y_true[attack_mask]).mean()) if attack_mask.any() else 0.0
-
-    present_labels = np.unique(y_true)
-    try:
-        if y_probs.ndim != 2 or y_probs.shape[0] != y_true.shape[0]:
-            auc = 0.5
-        elif len(present_labels) < 2:
-            auc = 0.5
-        elif len(class_names) == 2 and y_probs.shape[1] >= 2:
-            auc = float(roc_auc_score(y_true, y_probs[:, 1]))
-        else:
-            auc = _auc_ovr_macro(y_true, y_probs, present_labels)
-    except Exception:
-        auc = 0.5
-
-    return acc, prec, rec, f1, far, auc, asa, y_true, y_pred
+def evaluate_comprehensive_with_threshold_v2(
+    model,
+    dataloader,
+    device,
+    class_names,
+    threshold,
+    average="macro",
+):
+    return evaluate_comprehensive_with_threshold(
+        model,
+        dataloader,
+        device,
+        class_names,
+        threshold,
+        average=average,
+    )
 
 # 在创建数据集和数据加载器之前，添加以下重平衡函数
 def rebalance_graph_dataset(graph_data_seq, attack_label=0, normal_sample_ratio=0.1, random_seed1=42):
