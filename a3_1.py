@@ -671,12 +671,24 @@ def main():
         raise ValueError(f"Not enough unique time points for splitting: total_len={total_len}")
 
     if split_mode in {"stratified_time", "stratified", "balanced"}:
-        print(f"Performing Stratified Split by time_idx (ratios={train_ratio:.2f}:{val_ratio:.2f}:{1-train_ratio-val_ratio:.2f})...", flush=True)
+        print(
+            f"Performing Stratified Split by time_idx (ratios={train_ratio:.2f}:{val_ratio:.2f}:{1-train_ratio-val_ratio:.2f})...",
+            flush=True,
+        )
         n_train = int(total_len * train_ratio)
         n_val = int(total_len * val_ratio)
         n_train = max(1, min(total_len - 2, n_train))
         n_val = max(1, min(total_len - n_train - 1, n_val))
         n_test = total_len - n_train - n_val
+
+        num_classes = int(data["Label"].nunique())
+        min_val_classes = int(os.getenv("MIN_VAL_CLASSES", str(num_classes)))
+        min_test_classes = int(os.getenv("MIN_TEST_CLASSES", str(num_classes)))
+        min_val_per_class = int(os.getenv("MIN_VAL_PER_CLASS", "1"))
+        min_test_per_class = int(os.getenv("MIN_TEST_PER_CLASS", "1"))
+        ensure_split_classes = int(os.getenv("ENSURE_SPLIT_CLASSES", "1")) != 0
+        strict_split_classes = int(os.getenv("STRICT_SPLIT_CLASSES", "0")) != 0
+        fix_iters = max(0, int(os.getenv("SPLIT_FIX_ITERS", "200")))
 
         counts_by_time = (
             data.groupby(["time_idx", "Label"], sort=False)
@@ -690,31 +702,180 @@ def main():
         time_scores = counts_mat @ rarity
         order = np.argsort(-time_scores, kind="mergesort")
 
-        caps = {"train": n_train, "val": n_val, "test": n_test}
+        caps = {"train": int(n_train), "val": int(n_val), "test": int(n_test)}
         chosen = {"train": [], "val": [], "test": []}
-        set_counts = {"train": np.zeros_like(label_totals), "val": np.zeros_like(label_totals), "test": np.zeros_like(label_totals)}
+        set_counts = {
+            "train": np.zeros_like(label_totals),
+            "val": np.zeros_like(label_totals),
+            "test": np.zeros_like(label_totals),
+        }
+        idx_to_split = np.full(total_len, -1, dtype=np.int8)
 
-        def _objective(name, time_vec):
-            cap = caps[name]
-            fill = len(chosen[name]) / float(cap) if cap > 0 else 1.0
-            missing = (set_counts[name] == 0) & (time_vec > 0)
+        def _eligible(counts, min_classes, min_per_class):
+            if int(min_per_class) > 0:
+                ok = counts >= int(min_per_class)
+            else:
+                ok = counts > 0
+            return int(np.sum(ok)) >= int(min_classes)
+
+        def _add(split_name, idx):
+            chosen[split_name].append(int(idx))
+            idx_to_split[int(idx)] = {"train": 0, "val": 1, "test": 2}[split_name]
+            set_counts[split_name] = set_counts[split_name] + counts_mat[int(idx)]
+
+        def _remove(split_name, idx):
+            chosen[split_name].remove(int(idx))
+            idx_to_split[int(idx)] = -1
+            set_counts[split_name] = set_counts[split_name] - counts_mat[int(idx)]
+
+        def _objective(split_name, time_vec):
+            cap = caps[split_name]
+            fill = len(chosen[split_name]) / float(cap) if cap > 0 else 1.0
+            missing = (set_counts[split_name] == 0) & (time_vec > 0)
             gain = float(np.sum(rarity[missing]))
             return gain - 0.05 * fill
 
+        if ensure_split_classes:
+            class_order = np.argsort(label_totals, kind="mergesort").tolist()
+            for cls in class_order:
+                if int(label_totals[cls]) <= 0:
+                    continue
+                if len(chosen["test"]) < caps["test"] and int(set_counts["test"][cls]) < int(min_test_per_class):
+                    for idx in order.tolist():
+                        if idx_to_split[int(idx)] != -1:
+                            continue
+                        if int(counts_mat[int(idx), int(cls)]) <= 0:
+                            continue
+                        _add("test", idx)
+                        break
+                if len(chosen["val"]) < caps["val"] and int(set_counts["val"][cls]) < int(min_val_per_class):
+                    for idx in order.tolist():
+                        if idx_to_split[int(idx)] != -1:
+                            continue
+                        if int(counts_mat[int(idx), int(cls)]) <= 0:
+                            continue
+                        _add("val", idx)
+                        break
+
         for idx in order.tolist():
-            time_vec = counts_mat[idx]
+            if idx_to_split[int(idx)] != -1:
+                continue
+            time_vec = counts_mat[int(idx)]
             candidates = [k for k in ("train", "val", "test") if len(chosen[k]) < caps[k]]
             if not candidates:
                 break
             best = max(candidates, key=lambda k: _objective(k, time_vec))
-            chosen[best].append(idx)
-            set_counts[best] = set_counts[best] + time_vec
+            _add(best, idx)
 
         for name in ("train", "val", "test"):
             need = caps[name] - len(chosen[name])
-            if need > 0:
-                remaining = [i for i in range(total_len) if (i not in set(chosen["train"]) and i not in set(chosen["val"]) and i not in set(chosen["test"]))]
-                chosen[name].extend(remaining[:need])
+            if need <= 0:
+                continue
+            remaining = [i for i in range(total_len) if idx_to_split[int(i)] == -1]
+            for idx in remaining[:need]:
+                _add(name, idx)
+
+        if ensure_split_classes and fix_iters > 0:
+            def _fix_split(split_name, min_classes, min_per_class):
+                if caps[split_name] <= 0:
+                    return
+                other_names = [k for k in ("train", "val", "test") if k != split_name]
+                for _ in range(int(fix_iters)):
+                    if _eligible(set_counts[split_name], min_classes, min_per_class):
+                        break
+                    if int(min_per_class) > 0:
+                        deficit = np.maximum(0, int(min_per_class) - set_counts[split_name])
+                        need_mask = deficit > 0
+                    else:
+                        need_mask = set_counts[split_name] <= 0
+                    need_mask = need_mask & (label_totals > 0)
+                    if not bool(np.any(need_mask)):
+                        break
+
+                    best_cand = None
+                    best_gain = -1e18
+                    for idx in range(total_len):
+                        if idx_to_split[int(idx)] == {"train": 0, "val": 1, "test": 2}[split_name]:
+                            continue
+                        vec = counts_mat[int(idx)]
+                        if vec.sum() <= 0:
+                            continue
+                        if int(min_per_class) > 0:
+                            gain = float(np.sum(rarity[(vec > 0) & need_mask]))
+                        else:
+                            gain = float(np.sum(rarity[(vec > 0) & need_mask]))
+                        if gain > best_gain:
+                            best_gain = gain
+                            best_cand = int(idx)
+
+                    if best_cand is None or best_gain <= 0:
+                        break
+
+                    cand_from_id = int(idx_to_split[int(best_cand)])
+                    if cand_from_id < 0:
+                        break
+                    cand_from = {0: "train", 1: "val", 2: "test"}[cand_from_id]
+                    if cand_from == split_name:
+                        break
+
+                    cand_vec = counts_mat[int(best_cand)]
+                    current_counts = set_counts[split_name]
+                    if int(min_per_class) > 0:
+                        current_ok = current_counts >= int(min_per_class)
+                    else:
+                        current_ok = current_counts > 0
+
+                    best_victim = None
+                    best_net = -1e18
+                    for victim in chosen[split_name]:
+                        vvec = counts_mat[int(victim)]
+                        after = current_counts - vvec + cand_vec
+                        if int(min_per_class) > 0:
+                            after_ok = after >= int(min_per_class)
+                        else:
+                            after_ok = after > 0
+                        gain = float(np.sum(rarity[(~current_ok) & after_ok]))
+                        loss = float(np.sum(rarity[current_ok & (~after_ok)]))
+                        net = gain - loss
+                        if net > best_net:
+                            best_net = net
+                            best_victim = int(victim)
+
+                    if best_victim is None:
+                        break
+
+                    _remove(split_name, best_victim)
+                    _remove(cand_from, best_cand)
+                    _add(split_name, best_cand)
+                    _add(cand_from, best_victim)
+
+            _fix_split("test", min_test_classes, min_test_per_class)
+            _fix_split("val", min_val_classes, min_val_per_class)
+
+        if ensure_split_classes:
+            ok_val = _eligible(set_counts["val"], min_val_classes, min_val_per_class)
+            ok_test = _eligible(set_counts["test"], min_test_classes, min_test_per_class)
+            if (not ok_val) or (not ok_test):
+                def _missing(split_name, min_per_class):
+                    if int(min_per_class) > 0:
+                        miss = np.where(set_counts[split_name] < int(min_per_class))[0].tolist()
+                    else:
+                        miss = np.where(set_counts[split_name] <= 0)[0].tolist()
+                    miss = [c for c in miss if int(label_totals[c]) > 0]
+                    return miss
+
+                miss_val = _missing("val", min_val_per_class)
+                miss_test = _missing("test", min_test_per_class)
+                miss_val_names = [class_names[int(i)] for i in miss_val if int(i) < len(class_names)]
+                miss_test_names = [class_names[int(i)] for i in miss_test if int(i) < len(class_names)]
+                print(
+                    f"⚠️ Split coverage not satisfied. "
+                    f"VAL missing({len(miss_val_names)}): {miss_val_names} | "
+                    f"TEST missing({len(miss_test_names)}): {miss_test_names}",
+                    flush=True,
+                )
+                if strict_split_classes:
+                    raise ValueError("Split coverage not satisfied under STRICT_SPLIT_CLASSES=1")
 
         train_times = unique_times[np.array(chosen["train"], dtype=np.int64)]
         val_times = unique_times[np.array(chosen["val"], dtype=np.int64)]
