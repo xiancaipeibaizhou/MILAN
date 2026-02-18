@@ -668,21 +668,57 @@ def main():
         block_train_ratio = float(os.getenv("BLOCK_TRAIN_RATIO", "0.8"))
         block_val_ratio = float(os.getenv("BLOCK_VAL_RATIO", "0.1"))
         min_block_times = max(3, int(os.getenv("BLOCK_MIN_TIMES", "30")))
-        require_all_classes = int(os.getenv("BLOCK_REQUIRE_ALL_CLASSES", "1")) != 0
-        ensure_split_classes = int(os.getenv("BLOCK_ENSURE_SPLIT_CLASSES", "1")) != 0
+        block_build_mode = str(os.getenv("BLOCK_BUILD_MODE", "adaptive")).strip().lower()
+        require_all_classes = int(os.getenv("BLOCK_REQUIRE_ALL_CLASSES", "0")) != 0
+        ensure_split_classes = int(os.getenv("BLOCK_ENSURE_SPLIT_CLASSES", "0")) != 0
+        block_inner_split = str(os.getenv("BLOCK_INNER_SPLIT", "stratified_time")).strip().lower()
 
         min_val_classes = int(os.getenv("MIN_VAL_CLASSES", str(len(class_names))))
         min_test_classes = int(os.getenv("MIN_TEST_CLASSES", str(len(class_names))))
         min_val_per_class = int(os.getenv("MIN_VAL_PER_CLASS", "20"))
         min_test_per_class = int(os.getenv("MIN_TEST_PER_CLASS", "20"))
 
-        print(f"Performing Block-wise Temporal Split (N={num_blocks})...", flush=True)
+        print(
+            f"Performing Block-wise Temporal Split (N={num_blocks}, mode={block_build_mode}, inner={block_inner_split})...",
+            flush=True,
+        )
         unique_times = data["time_idx"].drop_duplicates().values
         total_len = len(unique_times)
         if total_len < 3:
             raise ValueError(f"Not enough unique time points for splitting: total_len={total_len}")
 
-        idx_splits = np.array_split(np.arange(total_len, dtype=np.int64), num_blocks)
+        if block_build_mode == "adaptive":
+            counts_by_time_all = (
+                data.groupby(["time_idx", "Label"], sort=False)
+                .size()
+                .unstack(fill_value=0)
+                .reindex(unique_times, fill_value=0)
+            )
+            counts_mat_all = counts_by_time_all.to_numpy(dtype=np.int64, copy=False)
+
+            idx_splits = []
+            start = 0
+            current_counts = np.zeros(counts_mat_all.shape[1], dtype=np.int64)
+            for i in range(total_len):
+                current_counts += counts_mat_all[i]
+                cur_len = i - start + 1
+
+                if len(idx_splits) >= (num_blocks - 1):
+                    continue
+
+                has_all = bool(np.all(current_counts > 0))
+                if cur_len >= min_block_times and ((not require_all_classes) or has_all):
+                    idx_splits.append(np.arange(start, i + 1, dtype=np.int64))
+                    start = i + 1
+                    current_counts = np.zeros(counts_mat_all.shape[1], dtype=np.int64)
+
+            if start < total_len:
+                idx_splits.append(np.arange(start, total_len, dtype=np.int64))
+            if len(idx_splits) == 0:
+                idx_splits = [np.arange(0, total_len, dtype=np.int64)]
+        else:
+            idx_splits = np.array_split(np.arange(total_len, dtype=np.int64), num_blocks)
+
         time_to_block = {}
         for b, idxs in enumerate(idx_splits):
             for t in unique_times[idxs]:
@@ -715,6 +751,7 @@ def main():
         effective_blocks = 0
 
         for b, idxs in enumerate(idx_splits):
+            print(f"[Block {b:02d}] Preparing...", flush=True)
             block_times = unique_times[idxs]
             if len(block_times) < min_block_times:
                 print(f"[Block {b:02d}] Skip: too few minutes (len={len(block_times)})", flush=True)
@@ -772,59 +809,186 @@ def main():
                     eligible = counts > 0
                 return int(np.sum(eligible)) >= int(min_classes)
 
-            train_idx = int(base_train_idx)
-            val_idx = int(base_val_idx)
-            adjusted = False
-            if ensure_split_classes:
-                step = max(1, int(block_len * 0.02))
-                found = False
-                train_idx_candidate = int(base_train_idx)
-                while train_idx_candidate >= 1 and not found:
-                    val_idx_candidate = int(min(block_len - 1, max(train_idx_candidate + 1, base_val_idx)))
-                    while val_idx_candidate > train_idx_candidate + 1 and not found:
-                        if _interval_ok(train_idx_candidate, val_idx_candidate, min_val_classes, min_val_per_class) and _test_ok(
-                            val_idx_candidate, min_test_classes, min_test_per_class
-                        ):
-                            train_idx = int(train_idx_candidate)
-                            val_idx = int(val_idx_candidate)
-                            found = True
-                            break
-                        val_idx_candidate = int(max(train_idx_candidate + 1, val_idx_candidate - step))
-                    if found:
-                        break
-                    train_idx_candidate = int(max(1, train_idx_candidate - step))
+            train_df = None
+            val_df = None
+            test_df = None
 
-                if not found:
+            if block_inner_split in {"stratified_time", "stratified", "balanced"}:
+                n_train = int(base_train_idx)
+                n_val = int(max(1, base_val_idx - base_train_idx))
+                n_test = int(max(1, block_len - base_val_idx))
+                n_total = int(n_train + n_val + n_test)
+                if n_total > block_len:
+                    overflow = n_total - block_len
+                    n_train = max(1, n_train - overflow)
+
+                totals = total_counts.astype(np.float64, copy=False)
+                rarity = 1.0 / (totals + 1.0)
+                time_scores = counts_mat @ rarity
+                order = np.argsort(-time_scores, kind="mergesort")
+
+                caps = {"train": int(n_train), "val": int(n_val), "test": int(n_test)}
+                chosen = {"train": [], "val": [], "test": []}
+                set_counts = {
+                    "train": np.zeros(counts_mat.shape[1], dtype=np.int64),
+                    "val": np.zeros(counts_mat.shape[1], dtype=np.int64),
+                    "test": np.zeros(counts_mat.shape[1], dtype=np.int64),
+                }
+                assigned = set()
+
+                def _eligible(counts, min_classes, min_per_class):
+                    if int(min_per_class) > 0:
+                        ok = counts >= int(min_per_class)
+                    else:
+                        ok = counts > 0
+                    return int(np.sum(ok)) >= int(min_classes)
+
+                def _gain(name, vec, min_classes, min_per_class):
+                    counts = set_counts[name]
+                    if int(min_per_class) > 0:
+                        need = np.maximum(0, int(min_per_class) - counts)
+                        add = np.minimum(vec, need)
+                        gain = float(np.sum(rarity * (add > 0)))
+                    else:
+                        missing = (counts == 0) & (vec > 0)
+                        gain = float(np.sum(rarity[missing]))
+                    fill = len(chosen[name]) / float(max(1, caps[name]))
+                    return gain - 0.05 * fill
+
+                for name, min_classes, min_per in (
+                    ("val", min_val_classes, min_val_per_class),
+                    ("test", min_test_classes, min_test_per_class),
+                ):
+                    if caps[name] <= 0:
+                        continue
+                    while (not _eligible(set_counts[name], min_classes, min_per)) and (len(chosen[name]) < caps[name]):
+                        best_idx = None
+                        best_gain = -1e9
+                        for idx in order.tolist():
+                            if idx in assigned:
+                                continue
+                            vec = counts_mat[idx]
+                            if vec.sum() <= 0:
+                                continue
+                            g = _gain(name, vec, min_classes, min_per)
+                            if g > best_gain:
+                                best_gain = g
+                                best_idx = idx
+                        if best_idx is None or best_gain <= 0:
+                            break
+                        chosen[name].append(best_idx)
+                        assigned.add(best_idx)
+                        set_counts[name] = set_counts[name] + counts_mat[best_idx]
+
+                for idx in order.tolist():
+                    if idx in assigned:
+                        continue
+                    candidates = [k for k in ("train", "val", "test") if len(chosen[k]) < caps[k]]
+                    if not candidates:
+                        break
+                    vec = counts_mat[idx]
+                    if vec.sum() <= 0:
+                        best = min(candidates, key=lambda k: len(chosen[k]) / float(max(1, caps[k])))
+                    else:
+                        best = max(
+                            candidates,
+                            key=lambda k: _gain(
+                                k,
+                                vec,
+                                min_val_classes if k == "val" else (min_test_classes if k == "test" else 0),
+                                min_val_per_class if k == "val" else (min_test_per_class if k == "test" else 0),
+                            ),
+                        )
+                    chosen[best].append(idx)
+                    assigned.add(idx)
+                    set_counts[best] = set_counts[best] + vec
+
+                remaining = [i for i in range(block_len) if i not in assigned]
+                for name in ("train", "val", "test"):
+                    need = caps[name] - len(chosen[name])
+                    if need > 0 and remaining:
+                        chosen[name].extend(remaining[:need])
+                        for j in remaining[:need]:
+                            set_counts[name] = set_counts[name] + counts_mat[j]
+                        remaining = remaining[need:]
+
+                if ensure_split_classes:
+                    ok_val = _eligible(set_counts["val"], min_val_classes, min_val_per_class)
+                    ok_test = _eligible(set_counts["test"], min_test_classes, min_test_per_class)
+                    if (not ok_val) or (not ok_test):
+                        print(
+                            f"[Block {b:02d}] Stratified inner split cannot satisfy label coverage; fallback to temporal split.",
+                            flush=True,
+                        )
+                        block_inner_split = "temporal"
+                if block_inner_split in {"stratified_time", "stratified", "balanced"}:
+                    train_times = block_times[np.array(sorted(chosen["train"]), dtype=np.int64)]
+                    val_times = block_times[np.array(sorted(chosen["val"]), dtype=np.int64)]
+                    test_times = block_times[np.array(sorted(chosen["test"]), dtype=np.int64)]
+                    train_df = block_df[block_df["time_idx"].isin(train_times)].copy()
+                    val_df = block_df[block_df["time_idx"].isin(val_times)].copy()
+                    test_df = block_df[block_df["time_idx"].isin(test_times)].copy()
+
+            if train_df is None or val_df is None or test_df is None:
+                train_idx = int(base_train_idx)
+                val_idx = int(base_val_idx)
+                adjusted = False
+                if ensure_split_classes:
+                    step = max(1, int(block_len * 0.02))
+                    found = False
+                    train_idx_candidate = int(base_train_idx)
+                    while train_idx_candidate >= 1 and not found:
+                        val_idx_candidate = int(min(block_len - 1, max(train_idx_candidate + 1, base_val_idx)))
+                        while val_idx_candidate > train_idx_candidate + 1 and not found:
+                            if _interval_ok(train_idx_candidate, val_idx_candidate, min_val_classes, min_val_per_class) and _test_ok(
+                                val_idx_candidate, min_test_classes, min_test_per_class
+                            ):
+                                train_idx = int(train_idx_candidate)
+                                val_idx = int(val_idx_candidate)
+                                found = True
+                                break
+                            val_idx_candidate = int(max(train_idx_candidate + 1, val_idx_candidate - step))
+                        if found:
+                            break
+                        train_idx_candidate = int(max(1, train_idx_candidate - step))
+
+                    if not found:
+                        print(
+                            f"[Block {b:02d}] Skip: cannot satisfy split label coverage "
+                            f"(MIN_VAL_CLASSES={min_val_classes}, MIN_TEST_CLASSES={min_test_classes}, "
+                            f"MIN_VAL_PER_CLASS={min_val_per_class}, MIN_TEST_PER_CLASS={min_test_per_class})",
+                            flush=True,
+                        )
+                        del block_df
+                        gc.collect()
+                        continue
+
+                    adjusted = (train_idx != base_train_idx) or (val_idx != base_val_idx)
+
+                split_time_train = block_times[train_idx]
+                split_time_val = block_times[val_idx]
+                train_df = block_df[block_df["time_idx"] < split_time_train].copy()
+                val_df = block_df[(block_df["time_idx"] >= split_time_train) & (block_df["time_idx"] < split_time_val)].copy()
+                test_df = block_df[block_df["time_idx"] >= split_time_val].copy()
+
+                if adjusted:
                     print(
-                        f"[Block {b:02d}] Skip: cannot satisfy split label coverage "
-                        f"(MIN_VAL_CLASSES={min_val_classes}, MIN_TEST_CLASSES={min_test_classes}, "
-                        f"MIN_VAL_PER_CLASS={min_val_per_class}, MIN_TEST_PER_CLASS={min_test_per_class})",
+                        f"[Block {b:02d}] Adjusted intra-block split for label coverage: "
+                        f"MIN_VAL_CLASSES={min_val_classes}, MIN_TEST_CLASSES={min_test_classes}, "
+                        f"MIN_VAL_PER_CLASS={min_val_per_class}, MIN_TEST_PER_CLASS={min_test_per_class}",
                         flush=True,
                     )
-                    del block_df
-                    gc.collect()
-                    continue
-
-                adjusted = (train_idx != base_train_idx) or (val_idx != base_val_idx)
-
-            split_time_train = block_times[train_idx]
-            split_time_val = block_times[val_idx]
-            train_df = block_df[block_df["time_idx"] < split_time_train].copy()
-            val_df = block_df[(block_df["time_idx"] >= split_time_train) & (block_df["time_idx"] < split_time_val)].copy()
-            test_df = block_df[block_df["time_idx"] >= split_time_val].copy()
-            del block_df
-
-            if adjusted:
                 print(
-                    f"[Block {b:02d}] Adjusted intra-block split for label coverage: "
-                    f"MIN_VAL_CLASSES={min_val_classes}, MIN_TEST_CLASSES={min_test_classes}, "
-                    f"MIN_VAL_PER_CLASS={min_val_per_class}, MIN_TEST_PER_CLASS={min_test_per_class}",
+                    f"\n[Block {b:02d}] Splitting: Train < {split_time_train} <= Val < {split_time_val} <= Test",
                     flush=True,
                 )
-            print(
-                f"\n[Block {b:02d}] Splitting: Train < {split_time_train} <= Val < {split_time_val} <= Test",
-                flush=True,
-            )
+            else:
+                print(
+                    f"\n[Block {b:02d}] Splitting: stratified_time on time_idx (minutes, disjoint)",
+                    flush=True,
+                )
+
+            del block_df
             print(
                 f"[Block {b:02d}] Split Sizes -> Train: {len(train_df)}, Val: {len(val_df)}, Test: {len(test_df)}",
                 flush=True,

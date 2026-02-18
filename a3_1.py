@@ -10,6 +10,7 @@ import glob
 import random
 import datetime
 import gc
+import warnings
 from tqdm import tqdm
 from hparams_a3 import resolve_hparams
 from torch_geometric.loader import DataLoader
@@ -69,6 +70,39 @@ UNK_SUBNET_ID = 0
 def get_subnet_id_safe(ip_str, subnet_map):
     key = _subnet_key(ip_str)
     return subnet_map.get(key, UNK_SUBNET_ID)
+
+def _parse_timestamp_series(ts):
+    ts = ts.astype(str)
+    sample = ts.replace({"nan": np.nan, "None": np.nan}).dropna().head(2000)
+    if len(sample) == 0:
+        return pd.to_datetime(ts, errors="coerce", dayfirst=True)
+
+    candidates = [
+        "%Y-%m-%d %H:%M:%S.%f",
+        "%Y-%m-%d %H:%M:%S",
+        "%d/%m/%Y %H:%M:%S",
+        "%d/%m/%Y %H:%M",
+        "%m/%d/%Y %H:%M:%S",
+        "%m/%d/%Y %H:%M",
+        "%d/%m/%Y %I:%M:%S %p",
+        "%m/%d/%Y %I:%M:%S %p",
+    ]
+
+    best_fmt = None
+    best_ok = -1
+    for fmt in candidates:
+        dt = pd.to_datetime(sample, format=fmt, errors="coerce")
+        ok = int(dt.notna().sum())
+        if ok > best_ok:
+            best_ok = ok
+            best_fmt = fmt
+
+    if best_fmt is not None and best_ok >= int(len(sample) * 0.9):
+        return pd.to_datetime(ts, format=best_fmt, errors="coerce")
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        return pd.to_datetime(ts, errors="coerce", dayfirst=True)
 
 # ==========================================
 # 1. 稀疏图构建函数 (修复版)
@@ -606,33 +640,105 @@ def main():
     data["Label"] = label_encoder.fit_transform(data["Label"])
     class_names = list(label_encoder.classes_)
     print(f"🏷️ Classes: {class_names}")
+    vc_all = data["Label"].value_counts().sort_index()
+    pairs_all = []
+    for label_id, cnt in vc_all.items():
+        label_name = class_names[int(label_id)] if int(label_id) < len(class_names) else str(label_id)
+        pairs_all.append(f"{label_name}({int(label_id)}):{int(cnt)}")
+    print("Overall Label Counts -> " + ", ".join(pairs_all), flush=True)
 
     # 时间处理
     print("Parsing Timestamps & Sorting...")
     # IDS2017 常见格式: "dd/MM/yyyy h:mm" 或 "dd/MM/yyyy hh:mm:ss a"
-    data["Timestamp"] = pd.to_datetime(data["Timestamp"], errors="coerce")
+    data["Timestamp"] = _parse_timestamp_series(data["Timestamp"])
     data.dropna(subset=["Timestamp", "Src IP", "Dst IP"], inplace=True)
     
     # 全局按时间排序 (这是时序学习的关键)
     data = data.sort_values("Timestamp").reset_index(drop=True)
     data["time_idx"] = data["Timestamp"].dt.floor("min")
 
-    print("Performing Temporal Split (8:1:1)...")
+    split_mode = str(os.getenv("SPLIT_MODE", "stratified_time")).strip().lower()
+    train_ratio = float(os.getenv("TRAIN_RATIO", "0.8"))
+    val_ratio = float(os.getenv("VAL_RATIO", "0.1"))
+    train_ratio = float(max(0.05, min(0.95, train_ratio)))
+    val_ratio = float(max(0.01, min(0.5, val_ratio)))
+    if train_ratio + val_ratio >= 0.99:
+        val_ratio = max(0.01, 0.99 - train_ratio)
+
     unique_times = data["time_idx"].drop_duplicates().values
     total_len = len(unique_times)
-    train_idx = int(total_len * 0.8)
-    val_idx = int(total_len * 0.9)
-    train_idx = max(1, min(total_len - 2, train_idx))
-    val_idx = max(train_idx + 1, min(total_len - 1, val_idx))
+    if total_len < 3:
+        raise ValueError(f"Not enough unique time points for splitting: total_len={total_len}")
 
-    split_time_train = unique_times[train_idx]
-    split_time_val = unique_times[val_idx]
-    print(f"Splitting: Train < {split_time_train} <= Val < {split_time_val} <= Test", flush=True)
+    if split_mode in {"stratified_time", "stratified", "balanced"}:
+        print(f"Performing Stratified Split by time_idx (ratios={train_ratio:.2f}:{val_ratio:.2f}:{1-train_ratio-val_ratio:.2f})...", flush=True)
+        n_train = int(total_len * train_ratio)
+        n_val = int(total_len * val_ratio)
+        n_train = max(1, min(total_len - 2, n_train))
+        n_val = max(1, min(total_len - n_train - 1, n_val))
+        n_test = total_len - n_train - n_val
 
-    train_df = data[data["time_idx"] < split_time_train].copy()
-    val_df = data[(data["time_idx"] >= split_time_train) & (data["time_idx"] < split_time_val)].copy()
-    test_df = data[data["time_idx"] >= split_time_val].copy()
-    del data
+        counts_by_time = (
+            data.groupby(["time_idx", "Label"], sort=False)
+            .size()
+            .unstack(fill_value=0)
+            .reindex(unique_times, fill_value=0)
+        )
+        counts_mat = counts_by_time.to_numpy(dtype=np.int64, copy=False)
+        label_totals = counts_mat.sum(axis=0)
+        rarity = 1.0 / (label_totals.astype(np.float64) + 1.0)
+        time_scores = counts_mat @ rarity
+        order = np.argsort(-time_scores, kind="mergesort")
+
+        caps = {"train": n_train, "val": n_val, "test": n_test}
+        chosen = {"train": [], "val": [], "test": []}
+        set_counts = {"train": np.zeros_like(label_totals), "val": np.zeros_like(label_totals), "test": np.zeros_like(label_totals)}
+
+        def _objective(name, time_vec):
+            cap = caps[name]
+            fill = len(chosen[name]) / float(cap) if cap > 0 else 1.0
+            missing = (set_counts[name] == 0) & (time_vec > 0)
+            gain = float(np.sum(rarity[missing]))
+            return gain - 0.05 * fill
+
+        for idx in order.tolist():
+            time_vec = counts_mat[idx]
+            candidates = [k for k in ("train", "val", "test") if len(chosen[k]) < caps[k]]
+            if not candidates:
+                break
+            best = max(candidates, key=lambda k: _objective(k, time_vec))
+            chosen[best].append(idx)
+            set_counts[best] = set_counts[best] + time_vec
+
+        for name in ("train", "val", "test"):
+            need = caps[name] - len(chosen[name])
+            if need > 0:
+                remaining = [i for i in range(total_len) if (i not in set(chosen["train"]) and i not in set(chosen["val"]) and i not in set(chosen["test"]))]
+                chosen[name].extend(remaining[:need])
+
+        train_times = unique_times[np.array(chosen["train"], dtype=np.int64)]
+        val_times = unique_times[np.array(chosen["val"], dtype=np.int64)]
+        test_times = unique_times[np.array(chosen["test"], dtype=np.int64)]
+
+        train_df = data[data["time_idx"].isin(train_times)].copy()
+        val_df = data[data["time_idx"].isin(val_times)].copy()
+        test_df = data[data["time_idx"].isin(test_times)].copy()
+        del data
+    else:
+        print("Performing Temporal Split (8:1:1)...")
+        train_idx = int(total_len * train_ratio)
+        val_idx = int(total_len * (train_ratio + val_ratio))
+        train_idx = max(1, min(total_len - 2, train_idx))
+        val_idx = max(train_idx + 1, min(total_len - 1, val_idx))
+
+        split_time_train = unique_times[train_idx]
+        split_time_val = unique_times[val_idx]
+        print(f"Splitting: Train < {split_time_train} <= Val < {split_time_val} <= Test", flush=True)
+
+        train_df = data[data["time_idx"] < split_time_train].copy()
+        val_df = data[(data["time_idx"] >= split_time_train) & (data["time_idx"] < split_time_val)].copy()
+        test_df = data[data["time_idx"] >= split_time_val].copy()
+        del data
 
     print(f"Final Split -> Train: {len(train_df)}, Val: {len(val_df)}, Test: {len(test_df)}", flush=True)
     print(f"Train Set Classes: {np.unique(train_df['Label'].values)}", flush=True)

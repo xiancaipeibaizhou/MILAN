@@ -665,6 +665,12 @@ def main():
     data['Label'] = label_encoder.fit_transform(data['Label'])
     class_names = list(label_encoder.classes_)
     print(f"Classes: {class_names}")
+    vc_all = data["Label"].value_counts().sort_index()
+    pairs_all = []
+    for label_id, cnt in vc_all.items():
+        label_name = class_names[int(label_id)] if int(label_id) < len(class_names) else str(label_id)
+        pairs_all.append(f"{label_name}({int(label_id)}):{int(cnt)}")
+    print("Overall Label Counts -> " + ", ".join(pairs_all), flush=True)
 
     # 时间处理
     print("Processing Time..." )
@@ -691,6 +697,17 @@ def main():
     test_df = data[data['time_idx'] >= split_time_val].copy()
 
     print(f"Train: {len(train_df)}, Val: {len(val_df)}, Test: {len(test_df)}")
+    def _print_label_counts(df, split_name):
+        vc = df["Label"].value_counts().sort_index()
+        pairs = []
+        for label_id, cnt in vc.items():
+            label_name = class_names[int(label_id)] if int(label_id) < len(class_names) else str(label_id)
+            pairs.append(f"{label_name}({int(label_id)}):{int(cnt)}")
+        print(f"{split_name} Label Counts -> " + ", ".join(pairs), flush=True)
+
+    _print_label_counts(train_df, "Train")
+    _print_label_counts(val_df, "Val")
+    _print_label_counts(test_df, "Test")
 
     # 归一化 (仅在训练集上 Fit)
     print("Normalizing (Fit on Train, Transform Test)..." )
