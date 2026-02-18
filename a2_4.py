@@ -304,14 +304,20 @@ def run_one_experiment(
         )
         return
 
+    num_workers = int(os.getenv("NUM_WORKERS", "0"))
+    loader_kwargs = {
+        "num_workers": num_workers,
+        "pin_memory": bool(torch.cuda.is_available()),
+        "persistent_workers": bool(num_workers > 0),
+    }
     train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True, collate_fn=temporal_collate_fn
+        train_dataset, batch_size=batch_size, shuffle=True, collate_fn=temporal_collate_fn, **loader_kwargs
     )
     val_loader = DataLoader(
-        val_dataset, batch_size=batch_size, shuffle=False, collate_fn=temporal_collate_fn
+        val_dataset, batch_size=batch_size, shuffle=False, collate_fn=temporal_collate_fn, **loader_kwargs
     )
     test_loader = DataLoader(
-        test_dataset, batch_size=batch_size, shuffle=False, collate_fn=temporal_collate_fn
+        test_dataset, batch_size=batch_size, shuffle=False, collate_fn=temporal_collate_fn, **loader_kwargs
     )
 
     print(
@@ -428,34 +434,21 @@ def run_one_experiment(
         avg_train_loss = total_loss / max(1, len(train_loader))
         avg_cl_loss = total_cl_loss / max(1, cl_loss_steps)
 
-        model.eval()
-        total_val_loss = 0.0
-        val_steps = 0
-        with torch.no_grad():
-            for batched_seq in val_loader:
-                if not batched_seq:
-                    continue
-                batched_seq = [g.to(device) for g in batched_seq]
-                out = model(graphs=batched_seq)
-                all_preds = out[0] if isinstance(out, tuple) else out
-                last_frame_pred = all_preds[-1]
-                last_frame_labels = batched_seq[-1].edge_labels
-
-                main_loss = criterion(last_frame_pred, last_frame_labels)
-                total_val_loss += float(main_loss.detach().item())
-                val_steps += 1
-
-        avg_val_loss = total_val_loss / max(1, val_steps)
-
-        val_acc, val_prec, val_rec, val_f1, val_far, val_auc, val_asa = evaluate_comprehensive(
-            model, val_loader, device, class_names
+        avg_val_loss, val_acc, val_prec, val_rec, val_f1, val_far, val_auc, val_asa = evaluate_comprehensive(
+            model,
+            val_loader,
+            device,
+            class_names,
+            average="macro",
+            criterion=criterion,
+            return_loss=True,
         )
         current_lr = optimizer.param_groups[0]["lr"]
         print(
             f"[{group_tag}] Epoch {epoch+1:03d} | "
             f"Loss: {avg_train_loss:.4f} | "
             f"Val Loss: {avg_val_loss:.4f} | "
-            f"Val F1: {val_f1:.4f} | "
+            f"Val F1(macro): {val_f1:.4f} | "
             f"ASA: {val_asa:.4f} | "
             f"Rec: {val_rec:.4f} | "
             f"FAR: {val_far:.4f} | "
@@ -465,7 +458,7 @@ def run_one_experiment(
         )
 
         metric_value = val_f1 if early_stop_metric == "val_f1" else val_asa
-        metric_display = "Val F1" if early_stop_metric == "val_f1" else "Val ASA"
+        metric_display = "Val F1(macro)" if early_stop_metric == "val_f1" else "Val ASA"
 
         if metric_value > best_metric + min_delta:
             best_metric = metric_value
@@ -630,45 +623,22 @@ def main():
     data = data.sort_values('Timestamp')
     data['time_idx'] = data['Timestamp'].dt.floor('min')
 
-    print("Performing Stratified Temporal Split (8:1:1 per class)...")
+    print("Performing Temporal Split (8:1:1)...")
+    unique_times = data["time_idx"].drop_duplicates().values
+    total_len = len(unique_times)
+    train_idx = int(total_len * 0.8)
+    val_idx = int(total_len * 0.9)
+    train_idx = max(1, min(total_len - 2, train_idx))
+    val_idx = max(train_idx + 1, min(total_len - 1, val_idx))
 
-    train_list = []
-    val_list = []
-    test_list = []
+    split_time_train = unique_times[train_idx]
+    split_time_val = unique_times[val_idx]
+    print(f"Splitting: Train < {split_time_train} <= Val < {split_time_val} <= Test", flush=True)
 
-    for label in data['Label'].unique():
-        cls_data = data[data['Label'] == label].sort_values('Timestamp')
-
-        unique_times = cls_data['time_idx'].drop_duplicates().values
-        total_len = len(unique_times)
-
-        if total_len < 3:
-            train_list.append(cls_data)
-            continue
-
-        train_idx = int(total_len * 0.8)
-        val_idx = int(total_len * 0.9)
-
-        train_idx = max(1, train_idx)
-        val_idx = max(train_idx + 1, val_idx)
-        train_idx = min(train_idx, total_len - 2)
-        val_idx = min(val_idx, total_len - 1)
-
-        split_time_train = unique_times[train_idx]
-        split_time_val = unique_times[val_idx]
-
-        train_list.append(cls_data[cls_data['time_idx'] < split_time_train])
-        val_list.append(
-            cls_data[
-                (cls_data['time_idx'] >= split_time_train)
-                & (cls_data['time_idx'] < split_time_val)
-            ]
-        )
-        test_list.append(cls_data[cls_data['time_idx'] >= split_time_val])
-
-    train_df = pd.concat(train_list).sort_values('Timestamp') if len(train_list) > 0 else data.iloc[0:0].copy()
-    val_df = pd.concat(val_list).sort_values('Timestamp') if len(val_list) > 0 else data.iloc[0:0].copy()
-    test_df = pd.concat(test_list).sort_values('Timestamp') if len(test_list) > 0 else data.iloc[0:0].copy()
+    train_df = data[data["time_idx"] < split_time_train].copy()
+    val_df = data[(data["time_idx"] >= split_time_train) & (data["time_idx"] < split_time_val)].copy()
+    test_df = data[data["time_idx"] >= split_time_val].copy()
+    del data
 
     print(f"Final Split -> Train: {len(train_df)}, Val: {len(val_df)}, Test: {len(test_df)}", flush=True)
     print(f"Train Set Classes: {np.unique(train_df['Label'].values)}", flush=True)

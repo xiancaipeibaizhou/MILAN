@@ -353,14 +353,20 @@ def run_one_experiment(
         )
         return
 
+    num_workers = int(os.getenv("NUM_WORKERS", "0"))
+    loader_kwargs = {
+        "num_workers": num_workers,
+        "pin_memory": bool(torch.cuda.is_available()),
+        "persistent_workers": bool(num_workers > 0),
+    }
     train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True, collate_fn=temporal_collate_fn
+        train_dataset, batch_size=batch_size, shuffle=True, collate_fn=temporal_collate_fn, **loader_kwargs
     )
     val_loader = DataLoader(
-        val_dataset, batch_size=batch_size, shuffle=False, collate_fn=temporal_collate_fn
+        val_dataset, batch_size=batch_size, shuffle=False, collate_fn=temporal_collate_fn, **loader_kwargs
     )
     test_loader = DataLoader(
-        test_dataset, batch_size=batch_size, shuffle=False, collate_fn=temporal_collate_fn
+        test_dataset, batch_size=batch_size, shuffle=False, collate_fn=temporal_collate_fn, **loader_kwargs
     )
 
     print(
@@ -476,35 +482,25 @@ def run_one_experiment(
         avg_loss = total_loss / max(1, len(train_loader))
         avg_cl_loss = total_cl_loss / max(1, cl_loss_steps)
 
-        model.eval()
-        total_val_loss = 0.0
-        val_steps = 0
-        with torch.no_grad():
-            for batched_seq in val_loader:
-                if not batched_seq:
-                    continue
-                batched_seq = [g.to(device) for g in batched_seq]
-                out = model(graphs=batched_seq)
-                all_preds = out[0] if isinstance(out, tuple) else out
-                val_loss = criterion(all_preds[-1], batched_seq[-1].edge_labels)
-                total_val_loss += float(val_loss.detach().item())
-                val_steps += 1
-
-        avg_val_loss = total_val_loss / max(1, val_steps)
-
-        val_acc, val_prec, val_rec, val_f1, val_far, val_auc, val_asa = evaluate_comprehensive(
-            model, val_loader, device, class_names
+        avg_val_loss, val_acc, val_prec, val_rec, val_f1, val_far, val_auc, val_asa = evaluate_comprehensive(
+            model,
+            val_loader,
+            device,
+            class_names,
+            average="macro",
+            criterion=criterion,
+            return_loss=True,
         )
 
         current_lr = optimizer.param_groups[0]["lr"]
         print(
             f"[{group_tag}] Epoch {epoch+1} | Loss: {avg_loss:.4f} | Val Loss: {avg_val_loss:.4f} | "
-            f"Val F1: {val_f1:.4f} | ASA: {val_asa:.4f} | CL Loss: {avg_cl_loss:.4f} | LR: {current_lr:.6f}",
+            f"Val F1(macro): {val_f1:.4f} | ASA: {val_asa:.4f} | CL Loss: {avg_cl_loss:.4f} | LR: {current_lr:.6f}",
             flush=True,
         )
 
         metric_value = val_f1 if early_stop_metric == "val_f1" else val_asa
-        metric_display = "Val F1" if early_stop_metric == "val_f1" else "Val ASA"
+        metric_display = "Val F1(macro)" if early_stop_metric == "val_f1" else "Val ASA"
 
         if metric_value > best_metric + min_delta:
             best_metric = metric_value

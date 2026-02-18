@@ -13,7 +13,8 @@ def _infer_normal_indices(class_names):
     normal_indices = []
     for idx, name in enumerate(class_names):
         name_lower = str(name).lower()
-        if ('benign' in name_lower) or ('normal' in name_lower) or ('non' in name_lower):
+        token = "".join(ch for ch in name_lower if ch.isalnum())
+        if ("benign" in token) or (token == "normal"):
             normal_indices.append(idx)
     return normal_indices
 
@@ -49,7 +50,16 @@ def _forward_logits_seq(model, graphs):
 # ==========================================
 # 3. 评估辅助函数
 # ==========================================
-def evaluate_comprehensive(model, dataloader, device, class_names):
+def evaluate_comprehensive(
+    model,
+    dataloader,
+    device,
+    class_names,
+    average="weighted",
+    return_details=False,
+    criterion=None,
+    return_loss=False,
+):
     """
     全指标评估：Acc, Prec, Rec, F1 + FAR, AUC, ASA
     """
@@ -57,15 +67,23 @@ def evaluate_comprehensive(model, dataloader, device, class_names):
     all_labels = []
     all_preds = []
     all_probs = []
+    loss_sum = 0.0
+    loss_steps = 0
 
     normal_indices = _infer_normal_indices(class_names)
 
     with torch.no_grad():
         for batched_seq in dataloader:
-            batched_seq = [g.to(device) for g in batched_seq]
+            batched_seq = [g.to(device, non_blocking=True) for g in batched_seq]
 
             preds_seq = _forward_logits_seq(model, batched_seq)
             logits = preds_seq[-1]
+            if (criterion is not None) and bool(return_loss):
+                try:
+                    loss_sum += float(criterion(logits, batched_seq[-1].edge_labels).detach().item())
+                    loss_steps += 1
+                except Exception:
+                    pass
 
             probs = torch.softmax(logits, dim=1)
             preds = torch.argmax(probs, dim=1)
@@ -75,6 +93,12 @@ def evaluate_comprehensive(model, dataloader, device, class_names):
             all_probs.extend(probs.cpu().numpy())
 
     if len(all_labels) == 0:
+        if return_details and return_loss:
+            return 0, 0, 0, 0, 0, 0, 0, 0, np.asarray([], dtype=int), np.asarray([], dtype=int), np.asarray([])
+        if return_details:
+            return 0, 0, 0, 0, 0, 0, 0, np.asarray([], dtype=int), np.asarray([], dtype=int), np.asarray([])
+        if return_loss:
+            return 0, 0, 0, 0, 0, 0, 0, 0
         return 0, 0, 0, 0, 0, 0, 0
 
     y_true = np.array(all_labels)
@@ -82,9 +106,9 @@ def evaluate_comprehensive(model, dataloader, device, class_names):
     y_probs = np.array(all_probs)
 
     acc = (y_pred == y_true).mean()
-    prec = precision_score(y_true, y_pred, average='weighted', zero_division=0)
-    rec = recall_score(y_true, y_pred, average='weighted', zero_division=0)
-    f1 = f1_score(y_true, y_pred, average='weighted', zero_division=0)
+    prec = precision_score(y_true, y_pred, average=str(average), zero_division=0)
+    rec = recall_score(y_true, y_pred, average=str(average), zero_division=0)
+    f1 = f1_score(y_true, y_pred, average=str(average), zero_division=0)
 
     is_true_normal = np.isin(y_true, normal_indices)
     is_pred_normal = np.isin(y_pred, normal_indices)
@@ -109,6 +133,13 @@ def evaluate_comprehensive(model, dataloader, device, class_names):
     except Exception:
         auc = 0.5
 
+    avg_loss = (loss_sum / max(1, loss_steps)) if bool(return_loss) else 0.0
+    if return_details and return_loss:
+        return avg_loss, acc, prec, rec, f1, far, auc, asa, y_true, y_pred, y_probs
+    if return_details:
+        return acc, prec, rec, f1, far, auc, asa, y_true, y_pred, y_probs
+    if return_loss:
+        return avg_loss, acc, prec, rec, f1, far, auc, asa
     return acc, prec, rec, f1, far, auc, asa
 
 def evaluate_with_threshold(model, dataloader, device, class_names, threshold=0.4):

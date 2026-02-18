@@ -252,89 +252,6 @@ def _save_confusion_matrix_png(cm, class_names, title, save_path):
 # 2. 评估与训练逻辑
 # ==========================================
 
-def train_loop(
-    model,
-    train_loader,
-    test_loader,
-    optimizer,
-    criterion,
-    scheduler,
-    num_epochs,
-    eval_interval,
-    save_dir,
-    device,
-    class_names,
-    accum_steps=1,
-):
-    accum_steps = max(1, int(accum_steps))
-    model.train()
-
-    print(f"Start Training (Total Epochs: {num_epochs})...")
-
-    for epoch in range(num_epochs):
-        total_loss = 0.0
-        batch_count = 0
-        optimizer.zero_grad()
-
-        pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs}', unit='batch')
-
-        for step, batched_seq in enumerate(pbar):
-            batched_seq = [g.to(device, non_blocking=True) for g in batched_seq]
-            preds = model(graphs=batched_seq, seq_len=len(batched_seq))
-            target = batched_seq[-1].edge_labels
-            loss_val = criterion(preds[-1], target)
-            loss_val = loss_val / accum_steps
-
-            loss_val.backward()
-
-            current_loss = float(loss_val.item()) * float(accum_steps)
-            total_loss += current_loss
-            batch_count += 1
-            pbar.set_postfix({'loss': f'{current_loss:.4f}'})
-
-            if (step + 1) % accum_steps == 0 or (step + 1) == len(train_loader):
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0)
-                optimizer.step()
-                optimizer.zero_grad()
-
-        avg_loss = total_loss / max(1, batch_count)
-        print(f'Epoch {epoch+1} finished. Avg Loss: {avg_loss:.6f}')
-
-        if scheduler:
-            scheduler.step()
-
-    print("\n" + "=" * 30)
-    print("Training Completed. Starting Final Evaluation...")
-    print("=" * 30)
-    y_true_attack, y_score = _collect_attack_scores(model, test_loader, device, class_names)
-    best_thresh, _, _, _ = _attack_best_threshold(y_true_attack, y_score, max_far=0.03)
-    acc, prec, rec, f1, far, auc, asa, y_true, y_pred = evaluate_comprehensive_with_threshold(
-        model, test_loader, device, class_names, threshold=best_thresh
-    )
-
-    print("\n" + "-" * 60)
-    print(f"Final Results (Epoch {num_epochs}):")
-    print(f"ACC: {acc:.2%}")
-    print(f"Pr:  {prec:.2%}")
-    print(f"Re:  {rec:.2%}")
-    print(f"F1:  {f1:.4f}")
-    print(f"FAR: {far:.2%}")
-    print(f"AUC: {auc:.4f}")
-    print(f"ASA: {asa:.2%}")
-    print("-" * 60 + "\n")
-
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
-    torch.save(model.state_dict(), os.path.join(save_dir, 'model_final.pth'))
-
-    cm_dir = os.path.join('png', 'output_cm')
-    _save_confusion_matrix_png(
-        confusion_matrix(y_true, y_pred),
-        class_names,
-        'Final Confusion Matrix',
-        os.path.join(cm_dir, 'cm_final.png'),
-    )
-
 # ==========================================
 # 3. 主程序
 # ==========================================
@@ -528,9 +445,21 @@ def run_one_experiment(group, h, train_seq, val_seq, test_seq, edge_dim, device)
         )
         return
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=temporal_collate_fn)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=temporal_collate_fn)
-    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, collate_fn=temporal_collate_fn)
+    num_workers = int(os.getenv("NUM_WORKERS", "0"))
+    loader_kwargs = {
+        "num_workers": num_workers,
+        "pin_memory": bool(torch.cuda.is_available()),
+        "persistent_workers": bool(num_workers > 0),
+    }
+    train_loader = DataLoader(
+        train_ds, batch_size=batch_size, shuffle=True, collate_fn=temporal_collate_fn, **loader_kwargs
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=batch_size, shuffle=False, collate_fn=temporal_collate_fn, **loader_kwargs
+    )
+    test_loader = DataLoader(
+        test_ds, batch_size=batch_size, shuffle=False, collate_fn=temporal_collate_fn, **loader_kwargs
+    )
 
     print(
         f"\n=== Experiment {group_tag} ===\n"
@@ -654,32 +583,28 @@ def run_one_experiment(group, h, train_seq, val_seq, test_seq, edge_dim, device)
         avg_loss = total_loss / max(1, len(train_loader))
         avg_cl_loss = total_cl_loss / max(1, cl_loss_steps)
 
-        model.eval()
-        total_val_loss = 0.0
-        val_steps = 0
-        with torch.no_grad():
-            for batched_seq in val_loader:
-                if not batched_seq:
-                    continue
-                batched_seq = [g.to(device) for g in batched_seq]
-                out = model(graphs=batched_seq)
-                all_preds = out[0] if isinstance(out, tuple) else out
-                val_loss = criterion(all_preds[-1], batched_seq[-1].edge_labels)
-                total_val_loss += float(val_loss.detach().item())
-                val_steps += 1
-
-        avg_val_loss = total_val_loss / max(1, val_steps)
-        val_acc, val_prec, val_rec, val_f1_weighted, val_far, val_auc, val_asa = evaluate_comprehensive(
-            model, val_loader, device, class_names
+        (
+            avg_val_loss,
+            _val_acc,
+            _val_prec,
+            _val_rec,
+            val_f1_macro,
+            _val_far,
+            _val_auc,
+            val_asa,
+            y_true_val,
+            y_pred_val,
+            _y_probs_val,
+        ) = evaluate_comprehensive(
+            model,
+            val_loader,
+            device,
+            class_names,
+            average="macro",
+            return_details=True,
+            criterion=criterion,
+            return_loss=True,
         )
-
-        _, _, _, _, _, _, _, y_true_val, y_pred_val = evaluate_comprehensive_with_threshold(
-            model, val_loader, device, class_names, threshold=1.1
-        )
-        try:
-            val_f1_macro = float(f1_score(y_true_val, y_pred_val, average="macro", zero_division=0))
-        except Exception:
-            val_f1_macro = 0.0
         try:
             val_f1_attack = float(f1_score(y_true_val, y_pred_val, average="binary", pos_label=1, zero_division=0))
         except Exception:
@@ -687,14 +612,14 @@ def run_one_experiment(group, h, train_seq, val_seq, test_seq, edge_dim, device)
         current_lr = optimizer.param_groups[0]["lr"]
         print(
             f"[{group_tag}] Epoch {epoch+1} | Loss: {avg_loss:.4f} | Val Loss: {avg_val_loss:.4f} | "
-            f"Val F1(macro): {val_f1_macro:.4f} | Val F1(weighted): {val_f1_weighted:.4f} | "
-            f"Val F1(attack): {val_f1_attack:.4f} | ASA: {val_asa:.4f} | CL Loss: {avg_cl_loss:.4f} | "
+            f"Val F1(macro): {val_f1_macro:.4f} | Val F1(attack): {val_f1_attack:.4f} | "
+            f"ASA: {val_asa:.4f} | CL Loss: {avg_cl_loss:.4f} | "
             f"LR: {current_lr:.6f}",
             flush=True,
         )
 
         metric_value = val_f1_macro if early_stop_metric == "val_f1" else val_asa
-        metric_display = "Val F1" if early_stop_metric == "val_f1" else "Val ASA"
+        metric_display = "Val F1(macro)" if early_stop_metric == "val_f1" else "Val ASA"
 
 
         if metric_value > best_metric + min_delta:
