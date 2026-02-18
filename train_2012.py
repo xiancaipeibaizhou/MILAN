@@ -609,11 +609,15 @@ def run_one_experiment(group, h, train_seq, val_seq, test_seq, edge_dim, device)
             val_f1_attack = float(f1_score(y_true_val, y_pred_val, average="binary", pos_label=1, zero_division=0))
         except Exception:
             val_f1_attack = 0.0
+        try:
+            val_f1_weighted = float(f1_score(y_true_val, y_pred_val, average="weighted", zero_division=0))
+        except Exception:
+            val_f1_weighted = 0.0
         current_lr = optimizer.param_groups[0]["lr"]
         print(
             f"[{group_tag}] Epoch {epoch+1} | Loss: {avg_loss:.4f} | Val Loss: {avg_val_loss:.4f} | "
-            f"Val F1(macro): {val_f1_macro:.4f} | Val F1(attack): {val_f1_attack:.4f} | "
-            f"ASA: {val_asa:.4f} | CL Loss: {avg_cl_loss:.4f} | "
+            f"Val F1(macro): {val_f1_macro:.4f} | Val F1(weighted): {val_f1_weighted:.4f} | Val F1(attack): {val_f1_attack:.4f} | "
+            f"ASA: {val_asa:.4f} | FPR: {_val_far:.4f} | CL Loss: {avg_cl_loss:.4f} | "
             f"LR: {current_lr:.6f}",
             flush=True,
         )

@@ -234,7 +234,26 @@ def evaluate_compatible(model, dataloader, device, class_names):
             all_labels.extend(batch[-1].edge_labels.cpu().numpy())
             all_preds.extend(preds.cpu().numpy())
 
-    return f1_score(all_labels, all_preds, average='weighted', zero_division=0)
+    y_true = np.asarray(all_labels, dtype=np.int64)
+    y_pred = np.asarray(all_preds, dtype=np.int64)
+
+    normal_indices = []
+    for idx, name in enumerate(class_names):
+        name_lower = str(name).lower().strip()
+        token = "".join(ch for ch in name_lower if ch.isalnum())
+        if ("benign" in name_lower) or (token == "normal") or (token in {"nonvpn", "nontor"}):
+            normal_indices.append(idx)
+    if len(normal_indices) == 0 and len(class_names) > 0:
+        normal_indices = [0]
+
+    is_true_normal = np.isin(y_true, normal_indices)
+    is_pred_normal = np.isin(y_pred, normal_indices)
+    fp = np.logical_and(is_true_normal, ~is_pred_normal).sum()
+    tn = np.logical_and(is_true_normal, is_pred_normal).sum()
+    fpr = float(fp / (fp + tn)) if (fp + tn) > 0 else 0.0
+
+    f1w = float(f1_score(y_true, y_pred, average="weighted", zero_division=0)) if y_true.size > 0 else 0.0
+    return f1w, fpr
 
 def evaluate_with_threshold_compatible(model, dataloader, device, class_names, threshold=0.4):
     model.eval()
@@ -482,20 +501,38 @@ def run_one_experiment(
         avg_loss = total_loss / max(1, len(train_loader))
         avg_cl_loss = total_cl_loss / max(1, cl_loss_steps)
 
-        avg_val_loss, val_acc, val_prec, val_rec, val_f1, val_far, val_auc, val_asa = evaluate_comprehensive(
+        (
+            avg_val_loss,
+            val_acc,
+            val_prec,
+            val_rec,
+            val_f1,
+            val_far,
+            val_auc,
+            val_asa,
+            y_true_val,
+            y_pred_val,
+            _y_probs_val,
+        ) = evaluate_comprehensive(
             model,
             val_loader,
             device,
             class_names,
             average="macro",
+            return_details=True,
             criterion=criterion,
             return_loss=True,
         )
+        try:
+            val_f1_weighted = float(f1_score(y_true_val, y_pred_val, average="weighted", zero_division=0))
+        except Exception:
+            val_f1_weighted = 0.0
 
         current_lr = optimizer.param_groups[0]["lr"]
         print(
             f"[{group_tag}] Epoch {epoch+1} | Loss: {avg_loss:.4f} | Val Loss: {avg_val_loss:.4f} | "
-            f"Val F1(macro): {val_f1:.4f} | ASA: {val_asa:.4f} | CL Loss: {avg_cl_loss:.4f} | LR: {current_lr:.6f}",
+            f"Val F1(macro): {val_f1:.4f} | Val F1(weighted): {val_f1_weighted:.4f} | "
+            f"ASA: {val_asa:.4f} | FPR: {val_far:.4f} | CL Loss: {avg_cl_loss:.4f} | LR: {current_lr:.6f}",
             flush=True,
         )
 

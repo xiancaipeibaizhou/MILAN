@@ -402,20 +402,38 @@ def run_one_experiment(
         avg_loss = total_loss / max(1, len(train_loader))
         avg_cl_loss = total_cl_loss / max(1, cl_loss_steps)
 
-        avg_val_loss, val_acc, val_prec, val_rec, val_f1, val_far, val_auc, val_asa = evaluate_comprehensive(
+        (
+            avg_val_loss,
+            val_acc,
+            val_prec,
+            val_rec,
+            val_f1,
+            val_far,
+            val_auc,
+            val_asa,
+            y_true_val,
+            y_pred_val,
+            _y_probs_val,
+        ) = evaluate_comprehensive(
             model,
             val_loader,
             device,
             class_names,
             average="macro",
+            return_details=True,
             criterion=criterion,
             return_loss=True,
         )
+        try:
+            val_f1_weighted = float(f1_score(y_true_val, y_pred_val, average="weighted", zero_division=0))
+        except Exception:
+            val_f1_weighted = 0.0
 
         current_lr = optimizer.param_groups[0]["lr"]
         print(
             f"[{group_tag}] Epoch {epoch+1} | Loss: {avg_loss:.4f} | Val Loss: {avg_val_loss:.4f} | "
-            f"Val F1(macro): {val_f1:.4f} | ASA: {val_asa:.4f} | CL Loss: {avg_cl_loss:.4f} | LR: {current_lr:.6f}",
+            f"Val F1(macro): {val_f1:.4f} | Val F1(weighted): {val_f1_weighted:.4f} | "
+            f"ASA: {val_asa:.4f} | FPR: {val_far:.4f} | CL Loss: {avg_cl_loss:.4f} | LR: {current_lr:.6f}",
             flush=True,
         )
 

@@ -426,7 +426,7 @@ def rebalance_graph_dataset(graph_data_seq, attack_label=0, normal_sample_ratio=
 
 
 # 修改后的evaluate
-def evaluate1(model, dataloader):
+def evaluate1(model, dataloader, class_names=None):
     model.eval()  # Set the model to evaluation mode
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -455,13 +455,25 @@ def evaluate1(model, dataloader):
     accuracy = (np.array(all_preds) == np.array(all_labels)).sum() / len(all_labels)
 
     # Calculate precision
-    precision = precision_score(all_labels, all_preds, average='weighted')
+    precision = precision_score(all_labels, all_preds, average='weighted', zero_division=0)
 
     # Calculate recall
-    recall = recall_score(all_labels, all_preds, average='weighted')
+    recall = recall_score(all_labels, all_preds, average='weighted', zero_division=0)
 
     # Calculate F1 score
-    f1 = f1_score(all_labels, all_preds, average='weighted')
+    f1 = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
+
+    y_true = np.asarray(all_labels, dtype=np.int64)
+    y_pred = np.asarray(all_preds, dtype=np.int64)
+    if class_names is not None:
+        normal_indices = _infer_normal_indices(class_names)
+    else:
+        normal_indices = [0]
+    is_true_normal = np.isin(y_true, normal_indices)
+    is_pred_normal = np.isin(y_pred, normal_indices)
+    fp = np.logical_and(is_true_normal, ~is_pred_normal).sum()
+    tn = np.logical_and(is_true_normal, is_pred_normal).sum()
+    fpr = float(fp / (fp + tn)) if (fp + tn) > 0 else 0.0
        
     # Calculate AUC value using probabilities instead of predictions
     try:
@@ -491,7 +503,7 @@ def evaluate1(model, dataloader):
     model.train()  # Revert model to training mode
  
     # Return evaluation metrics
-    return accuracy, precision, recall, f1, auc,all_probabilities,all_labels,all_preds,auc1
+    return accuracy, precision, recall, f1, auc, all_probabilities, all_labels, all_preds, auc1, fpr
 
 
 class FocalLoss(nn.Module):

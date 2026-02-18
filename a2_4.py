@@ -255,6 +255,7 @@ def run_one_experiment(
     class_names,
     weights_cpu,
     device,
+    run_tag_prefix="",
 ):
     group = (group or "").strip().upper()
     group_tag = group if group else "CUSTOM"
@@ -359,7 +360,11 @@ def run_one_experiment(
     os.makedirs(save_dir, exist_ok=True)
     kernel_tag = "-".join(str(k) for k in kernels)
     time_str = datetime.datetime.now().strftime("%m%d_%H%M")
-    run_tag = f"{group_tag}_seq{seq_len}_h{hidden}_k{kernel_tag}_cls{len(class_names)}_{time_str}"
+    prefix = str(run_tag_prefix).strip()
+    if prefix:
+        run_tag = f"{prefix}_{group_tag}_seq{seq_len}_h{hidden}_k{kernel_tag}_cls{len(class_names)}_{time_str}"
+    else:
+        run_tag = f"{group_tag}_seq{seq_len}_h{hidden}_k{kernel_tag}_cls{len(class_names)}_{time_str}"
     best_model_path = os.path.join(save_dir, f"roen_final_best_{run_tag}.pth")
     print(f"Best model will be saved to: {best_model_path}", flush=True)
 
@@ -434,24 +439,42 @@ def run_one_experiment(
         avg_train_loss = total_loss / max(1, len(train_loader))
         avg_cl_loss = total_cl_loss / max(1, cl_loss_steps)
 
-        avg_val_loss, val_acc, val_prec, val_rec, val_f1, val_far, val_auc, val_asa = evaluate_comprehensive(
+        (
+            avg_val_loss,
+            val_acc,
+            val_prec,
+            val_rec,
+            val_f1,
+            val_far,
+            val_auc,
+            val_asa,
+            y_true_val,
+            y_pred_val,
+            _y_probs_val,
+        ) = evaluate_comprehensive(
             model,
             val_loader,
             device,
             class_names,
             average="macro",
+            return_details=True,
             criterion=criterion,
             return_loss=True,
         )
+        try:
+            val_f1_weighted = float(f1_score(y_true_val, y_pred_val, average="weighted", zero_division=0))
+        except Exception:
+            val_f1_weighted = 0.0
         current_lr = optimizer.param_groups[0]["lr"]
         print(
             f"[{group_tag}] Epoch {epoch+1:03d} | "
             f"Loss: {avg_train_loss:.4f} | "
             f"Val Loss: {avg_val_loss:.4f} | "
             f"Val F1(macro): {val_f1:.4f} | "
+            f"Val F1(weighted): {val_f1_weighted:.4f} | "
             f"ASA: {val_asa:.4f} | "
             f"Rec: {val_rec:.4f} | "
-            f"FAR: {val_far:.4f} | "
+            f"FPR: {val_far:.4f} | "
             f"CL Loss: {avg_cl_loss:.4f} | "
             f"LR: {current_lr:.6f}",
             flush=True,
@@ -590,6 +613,22 @@ def run_one_experiment(
         print(f"[{group_tag}] Plotting failed: {e}", flush=True)
 
     print(f"[{group_tag}] Total Time: {time.time() - start_time:.2f}s", flush=True)
+    return {
+        "group": group_tag,
+        "seq_len": seq_len,
+        "hidden": hidden,
+        "heads": heads,
+        "dropedge_p": dropedge_p,
+        "optimal_thresh": float(optimal_thresh),
+        "opt_f1": float(opt_f1),
+        "opt_asa": float(opt_asa),
+        "opt_far": float(opt_far),
+        "opt_auc": float(opt_auc),
+        "final_f1": float(final_f1),
+        "final_asa": float(final_asa),
+        "final_far": float(final_far),
+        "final_auc": float(final_auc),
+    }
 
 # ==========================================
 # 3. 主训练流程
@@ -623,6 +662,329 @@ def main():
     data = data.sort_values('Timestamp')
     data['time_idx'] = data['Timestamp'].dt.floor('min')
 
+    blockwise = int(os.getenv("BLOCKWISE_SPLIT", "1"))
+    if blockwise != 0:
+        num_blocks = max(1, int(os.getenv("NUM_BLOCKS", "10")))
+        block_train_ratio = float(os.getenv("BLOCK_TRAIN_RATIO", "0.8"))
+        block_val_ratio = float(os.getenv("BLOCK_VAL_RATIO", "0.1"))
+        min_block_times = max(3, int(os.getenv("BLOCK_MIN_TIMES", "30")))
+        require_all_classes = int(os.getenv("BLOCK_REQUIRE_ALL_CLASSES", "1")) != 0
+        ensure_split_classes = int(os.getenv("BLOCK_ENSURE_SPLIT_CLASSES", "1")) != 0
+
+        min_val_classes = int(os.getenv("MIN_VAL_CLASSES", str(len(class_names))))
+        min_test_classes = int(os.getenv("MIN_TEST_CLASSES", str(len(class_names))))
+        min_val_per_class = int(os.getenv("MIN_VAL_PER_CLASS", "20"))
+        min_test_per_class = int(os.getenv("MIN_TEST_PER_CLASS", "20"))
+
+        print(f"Performing Block-wise Temporal Split (N={num_blocks})...", flush=True)
+        unique_times = data["time_idx"].drop_duplicates().values
+        total_len = len(unique_times)
+        if total_len < 3:
+            raise ValueError(f"Not enough unique time points for splitting: total_len={total_len}")
+
+        idx_splits = np.array_split(np.arange(total_len, dtype=np.int64), num_blocks)
+        time_to_block = {}
+        for b, idxs in enumerate(idx_splits):
+            for t in unique_times[idxs]:
+                time_to_block[t] = b
+        data["block_id"] = data["time_idx"].map(time_to_block).astype(np.int16)
+        block_indices = data.groupby("block_id", sort=False).indices
+        block_label_counts = data.groupby(["block_id", "Label"], sort=False).size().unstack(fill_value=0)
+        block_label_counts = block_label_counts.reindex(range(num_blocks), fill_value=0)
+
+        raw_groups = os.getenv("HP_GROUPS", "").strip()
+        if raw_groups:
+            raw = raw_groups.replace(";", ",").replace("\n", ",").replace(" ", ",")
+            groups = [g.strip() for g in raw.split(",") if g.strip()]
+        else:
+            groups = [os.getenv("HP_GROUP", "").strip()]
+        groups = [g for g in groups if str(g).strip() != ""]
+        if len(groups) == 0:
+            groups = ["BEST"]
+
+        def _print_label_counts(df, split_name):
+            vc = df['Label'].value_counts().sort_index()
+            pairs = []
+            for label_id, cnt in vc.items():
+                label_name = class_names[int(label_id)] if int(label_id) < len(class_names) else str(label_id)
+                pairs.append(f"{label_name}({int(label_id)}):{int(cnt)}")
+            print(f"{split_name} Label Counts -> " + ", ".join(pairs), flush=True)
+
+        results_by_group = {str(g).strip().upper() or "CUSTOM": [] for g in groups}
+        overall_start = time.time()
+        effective_blocks = 0
+
+        for b, idxs in enumerate(idx_splits):
+            block_times = unique_times[idxs]
+            if len(block_times) < min_block_times:
+                print(f"[Block {b:02d}] Skip: too few minutes (len={len(block_times)})", flush=True)
+                continue
+
+            if require_all_classes:
+                row = block_label_counts.loc[b].to_numpy(dtype=np.int64, copy=False)
+                present = np.flatnonzero(row > 0).tolist()
+                if len(present) < len(class_names):
+                    missing = sorted(list(set(range(len(class_names))) - set(present)))
+                    missing_names = [class_names[i] for i in missing if i < len(class_names)]
+                    print(f"[Block {b:02d}] Skip: missing classes {missing} ({missing_names})", flush=True)
+                    continue
+
+            pos = block_indices.get(b, None)
+            if pos is None or len(pos) == 0:
+                print(f"[Block {b:02d}] Skip: empty block", flush=True)
+                continue
+            block_df = data.iloc[pos].copy()
+
+            block_len = len(block_times)
+            base_train_idx = int(block_len * block_train_ratio)
+            base_val_idx = int(block_len * (block_train_ratio + block_val_ratio))
+            base_train_idx = max(1, min(block_len - 2, base_train_idx))
+            base_val_idx = max(base_train_idx + 1, min(block_len - 1, base_val_idx))
+
+            counts_by_time = (
+                block_df.groupby(["time_idx", "Label"], sort=False)
+                .size()
+                .unstack(fill_value=0)
+                .reindex(block_times, fill_value=0)
+            )
+            counts_mat = counts_by_time.to_numpy(dtype=np.int64, copy=False)
+            prefix = np.cumsum(counts_mat, axis=0, dtype=np.int64)
+            prefix0 = np.vstack([np.zeros((1, prefix.shape[1]), dtype=np.int64), prefix])
+            total_counts = prefix0[-1]
+
+            def _interval_ok(start, end, min_classes, min_per_class):
+                if end <= start:
+                    return False
+                counts = prefix0[end] - prefix0[start]
+                if int(min_per_class) > 0:
+                    eligible = counts >= int(min_per_class)
+                else:
+                    eligible = counts > 0
+                return int(np.sum(eligible)) >= int(min_classes)
+
+            def _test_ok(start, min_classes, min_per_class):
+                if start >= block_len:
+                    return False
+                counts = total_counts - prefix0[start]
+                if int(min_per_class) > 0:
+                    eligible = counts >= int(min_per_class)
+                else:
+                    eligible = counts > 0
+                return int(np.sum(eligible)) >= int(min_classes)
+
+            train_idx = int(base_train_idx)
+            val_idx = int(base_val_idx)
+            adjusted = False
+            if ensure_split_classes:
+                step = max(1, int(block_len * 0.02))
+                found = False
+                train_idx_candidate = int(base_train_idx)
+                while train_idx_candidate >= 1 and not found:
+                    val_idx_candidate = int(min(block_len - 1, max(train_idx_candidate + 1, base_val_idx)))
+                    while val_idx_candidate > train_idx_candidate + 1 and not found:
+                        if _interval_ok(train_idx_candidate, val_idx_candidate, min_val_classes, min_val_per_class) and _test_ok(
+                            val_idx_candidate, min_test_classes, min_test_per_class
+                        ):
+                            train_idx = int(train_idx_candidate)
+                            val_idx = int(val_idx_candidate)
+                            found = True
+                            break
+                        val_idx_candidate = int(max(train_idx_candidate + 1, val_idx_candidate - step))
+                    if found:
+                        break
+                    train_idx_candidate = int(max(1, train_idx_candidate - step))
+
+                if not found:
+                    print(
+                        f"[Block {b:02d}] Skip: cannot satisfy split label coverage "
+                        f"(MIN_VAL_CLASSES={min_val_classes}, MIN_TEST_CLASSES={min_test_classes}, "
+                        f"MIN_VAL_PER_CLASS={min_val_per_class}, MIN_TEST_PER_CLASS={min_test_per_class})",
+                        flush=True,
+                    )
+                    del block_df
+                    gc.collect()
+                    continue
+
+                adjusted = (train_idx != base_train_idx) or (val_idx != base_val_idx)
+
+            split_time_train = block_times[train_idx]
+            split_time_val = block_times[val_idx]
+            train_df = block_df[block_df["time_idx"] < split_time_train].copy()
+            val_df = block_df[(block_df["time_idx"] >= split_time_train) & (block_df["time_idx"] < split_time_val)].copy()
+            test_df = block_df[block_df["time_idx"] >= split_time_val].copy()
+            del block_df
+
+            if adjusted:
+                print(
+                    f"[Block {b:02d}] Adjusted intra-block split for label coverage: "
+                    f"MIN_VAL_CLASSES={min_val_classes}, MIN_TEST_CLASSES={min_test_classes}, "
+                    f"MIN_VAL_PER_CLASS={min_val_per_class}, MIN_TEST_PER_CLASS={min_test_per_class}",
+                    flush=True,
+                )
+            print(
+                f"\n[Block {b:02d}] Splitting: Train < {split_time_train} <= Val < {split_time_val} <= Test",
+                flush=True,
+            )
+            print(
+                f"[Block {b:02d}] Split Sizes -> Train: {len(train_df)}, Val: {len(val_df)}, Test: {len(test_df)}",
+                flush=True,
+            )
+            _print_label_counts(train_df, f"[Block {b:02d}] Train")
+            _print_label_counts(val_df, f"[Block {b:02d}] Val")
+            _print_label_counts(test_df, f"[Block {b:02d}] Test")
+
+            if len(train_df) == 0 or len(val_df) == 0 or len(test_df) == 0:
+                print(f"[Block {b:02d}] Skip: empty split", flush=True)
+                del train_df, val_df, test_df
+                gc.collect()
+                continue
+
+            print(f"[Block {b:02d}] Performing Normalization (Inductive)...", flush=True)
+            numeric_cols = train_df.select_dtypes(include=[np.number]).columns.tolist()
+            exclude_cols = ['Label', 'Timestamp', 'Src IP', 'Dst IP', 'Flow ID', 'Src Port', 'Dst Port', 'time_idx', 'block_id']
+            feat_cols = [c for c in numeric_cols if c not in exclude_cols]
+
+            for col in feat_cols:
+                train_col = pd.to_numeric(train_df[col], errors="coerce")
+                finite_mask = np.isfinite(train_col.to_numpy(dtype=np.float64, copy=False))
+                if finite_mask.any():
+                    finite_vals = train_col.to_numpy(dtype=np.float64, copy=False)[finite_mask]
+                    finite_max = float(np.max(finite_vals))
+                    finite_min = float(np.min(finite_vals))
+                else:
+                    finite_max = 0.0
+                    finite_min = 0.0
+
+                train_df[col] = train_df[col].replace([np.inf], finite_max).replace([-np.inf], finite_min)
+                val_df[col] = val_df[col].replace([np.inf], finite_max).replace([-np.inf], finite_min)
+                test_df[col] = test_df[col].replace([np.inf], finite_max).replace([-np.inf], finite_min)
+
+            train_df[feat_cols] = train_df[feat_cols].fillna(0)
+            val_df[feat_cols] = val_df[feat_cols].fillna(0)
+            test_df[feat_cols] = test_df[feat_cols].fillna(0)
+
+            for col in feat_cols:
+                if train_df[col].max() > 100:
+                    train_df[col] = np.log1p(train_df[col].abs())
+                    val_df[col] = np.log1p(val_df[col].abs())
+                    test_df[col] = np.log1p(test_df[col].abs())
+
+            scaler = StandardScaler()
+            train_df[feat_cols] = scaler.fit_transform(train_df[feat_cols])
+            val_df[feat_cols] = scaler.transform(val_df[feat_cols])
+            test_df[feat_cols] = scaler.transform(test_df[feat_cols])
+            print(f"[Block {b:02d}] Normalization Done.", flush=True)
+
+            print(f"[Block {b:02d}] Building Subnet Map (From Train Set Only)...", flush=True)
+            train_df['Src IP'] = train_df['Src IP'].astype(str).str.strip()
+            train_df['Dst IP'] = train_df['Dst IP'].astype(str).str.strip()
+            train_ips = pd.concat([train_df['Src IP'], train_df['Dst IP']]).unique()
+            subnet_to_idx = {'<UNK>': UNK_SUBNET_ID}
+            for ip in train_ips:
+                key = _subnet_key(ip)
+                if key not in subnet_to_idx:
+                    subnet_to_idx[key] = len(subnet_to_idx)
+
+            print(f"[Block {b:02d}] Constructing Train Graphs...", flush=True)
+            train_grouped = train_df.groupby('time_idx', sort=True)
+            train_seqs = []
+            for name, group in tqdm(train_grouped, leave=False):
+                g = create_graph_data_inductive(group, subnet_to_idx, None, name)
+                if g:
+                    train_seqs.append(g)
+
+            print(f"[Block {b:02d}] Constructing Val Graphs...", flush=True)
+            val_grouped = val_df.groupby('time_idx', sort=True)
+            val_seqs = []
+            for name, group in tqdm(val_grouped, leave=False):
+                g = create_graph_data_inductive(group, subnet_to_idx, None, name)
+                if g:
+                    val_seqs.append(g)
+
+            print(f"[Block {b:02d}] Constructing Test Graphs...", flush=True)
+            test_grouped = test_df.groupby('time_idx', sort=True)
+            test_seqs = []
+            for name, group in tqdm(test_grouped, leave=False):
+                g = create_graph_data_inductive(group, subnet_to_idx, None, name)
+                if g:
+                    test_seqs.append(g)
+
+            if len(train_seqs) > 0:
+                edge_dim = train_seqs[0].edge_attr.shape[1]
+            elif len(test_seqs) > 0:
+                edge_dim = test_seqs[0].edge_attr.shape[1]
+            else:
+                print(f"[Block {b:02d}] Skip: no graphs constructed", flush=True)
+                del train_df, val_df, test_df, train_seqs, val_seqs, test_seqs
+                gc.collect()
+                continue
+
+            label_counts = train_df["Label"].value_counts().sort_index()
+            full_counts = np.zeros(len(class_names))
+            for i, count in label_counts.items():
+                idx = int(i)
+                if idx < len(full_counts):
+                    full_counts[idx] = count
+            weights_cpu = 1.0 / (torch.sqrt(torch.tensor(full_counts, dtype=torch.float)) + 1.0)
+            weights_cpu = weights_cpu / weights_cpu.sum() * len(class_names)
+
+            block_prefix = f"b{b:02d}"
+            for g in groups:
+                group_tag = str(g).strip().upper() or "CUSTOM"
+                try:
+                    h = resolve_hparams(g, env=os.environ, dataset="darknet2020")
+                    res = run_one_experiment(
+                        g,
+                        h,
+                        train_seqs,
+                        val_seqs,
+                        test_seqs,
+                        edge_dim,
+                        class_names,
+                        weights_cpu,
+                        DEVICE,
+                        run_tag_prefix=block_prefix,
+                    )
+                    if isinstance(res, dict):
+                        results_by_group[group_tag].append(res)
+                except torch.OutOfMemoryError as e:
+                    print(f"[{block_prefix}][{group_tag}] CUDA OOM, skip this group. Error: {e}", flush=True)
+                except RuntimeError as e:
+                    if "CUDA out of memory" in str(e):
+                        print(f"[{block_prefix}][{group_tag}] CUDA OOM, skip this group. Error: {e}", flush=True)
+                    else:
+                        raise
+                finally:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    gc.collect()
+
+            effective_blocks += 1
+            del train_df, val_df, test_df, train_seqs, val_seqs, test_seqs
+            gc.collect()
+
+        print(f"\nBlock-wise Done. Effective Blocks: {effective_blocks}", flush=True)
+        for group_tag, items in results_by_group.items():
+            if not items:
+                print(f"[{group_tag}] No valid blocks", flush=True)
+                continue
+            opt_f1s = [float(x.get("opt_f1", 0.0)) for x in items]
+            opt_asas = [float(x.get("opt_asa", 0.0)) for x in items]
+            opt_fars = [float(x.get("opt_far", 0.0)) for x in items]
+            opt_aucs = [float(x.get("opt_auc", 0.0)) for x in items]
+            print(
+                f"[{group_tag}] Block-Avg (OptThresh on Val) -> "
+                f"F1(macro): {float(np.mean(opt_f1s)):.4f}, "
+                f"ASA: {float(np.mean(opt_asas)):.4f}, "
+                f"FPR: {float(np.mean(opt_fars)):.4f}, "
+                f"AUC: {float(np.mean(opt_aucs)):.4f} | "
+                f"Blocks: {len(items)}",
+                flush=True,
+            )
+
+        print(f"\nAll Experiments Done. Total Time: {time.time() - overall_start:.2f}s", flush=True)
+        return
+
     print("Performing Temporal Split (8:1:1)...")
     unique_times = data["time_idx"].drop_duplicates().values
     total_len = len(unique_times)
@@ -631,8 +993,74 @@ def main():
     train_idx = max(1, min(total_len - 2, train_idx))
     val_idx = max(train_idx + 1, min(total_len - 1, val_idx))
 
+    min_val_classes = int(os.getenv("MIN_VAL_CLASSES", "3"))
+    min_test_classes = int(os.getenv("MIN_TEST_CLASSES", "3"))
+    min_val_per_class = int(os.getenv("MIN_VAL_PER_CLASS", "20"))
+    min_test_per_class = int(os.getenv("MIN_TEST_PER_CLASS", "20"))
+    step = max(1, int(total_len * 0.01))
+    adjusted = False
+
+    counts_by_time = (
+        data.groupby(["time_idx", "Label"], sort=False)
+        .size()
+        .unstack(fill_value=0)
+        .reindex(unique_times, fill_value=0)
+    )
+    counts_mat = counts_by_time.to_numpy(dtype=np.int64, copy=False)
+    prefix = np.cumsum(counts_mat, axis=0, dtype=np.int64)
+    prefix0 = np.vstack([np.zeros((1, prefix.shape[1]), dtype=np.int64), prefix])
+    total_counts = prefix0[-1]
+
+    def _interval_ok(start, end, min_classes, min_per_class):
+        if end <= start:
+            return False
+        counts = prefix0[end] - prefix0[start]
+        if int(min_per_class) > 0:
+            eligible = counts >= int(min_per_class)
+        else:
+            eligible = counts > 0
+        return int(np.sum(eligible)) >= int(min_classes)
+
+    def _test_ok(start, min_classes, min_per_class):
+        if start >= total_len:
+            return False
+        counts = total_counts - prefix0[start]
+        if int(min_per_class) > 0:
+            eligible = counts >= int(min_per_class)
+        else:
+            eligible = counts > 0
+        return int(np.sum(eligible)) >= int(min_classes)
+
+    base_train_idx = int(train_idx)
+    base_val_idx = int(val_idx)
+    found = False
+    train_idx_candidate = int(train_idx)
+    while train_idx_candidate >= 1 and not found:
+        val_idx_candidate = int(min(total_len - 1, max(train_idx_candidate + 1, base_val_idx)))
+        while val_idx_candidate > train_idx_candidate + 1 and not found:
+            if _interval_ok(train_idx_candidate, val_idx_candidate, min_val_classes, min_val_per_class) and _test_ok(
+                val_idx_candidate, min_test_classes, min_test_per_class
+            ):
+                train_idx = int(train_idx_candidate)
+                val_idx = int(val_idx_candidate)
+                found = True
+                break
+            val_idx_candidate = int(max(train_idx_candidate + 1, val_idx_candidate - step))
+        if found:
+            break
+        train_idx_candidate = int(max(1, train_idx_candidate - step))
+
+    adjusted = (train_idx != base_train_idx) or (val_idx != base_val_idx)
+
     split_time_train = unique_times[train_idx]
     split_time_val = unique_times[val_idx]
+    if adjusted:
+        print(
+            "Adjusted split to ensure label coverage: "
+            f"MIN_VAL_CLASSES={min_val_classes}, MIN_TEST_CLASSES={min_test_classes}, "
+            f"MIN_VAL_PER_CLASS={min_val_per_class}, MIN_TEST_PER_CLASS={min_test_per_class}",
+            flush=True,
+        )
     print(f"Splitting: Train < {split_time_train} <= Val < {split_time_val} <= Test", flush=True)
 
     train_df = data[data["time_idx"] < split_time_train].copy()
