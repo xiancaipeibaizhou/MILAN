@@ -586,14 +586,36 @@ def run_one_experiment(
         flush=True,
     )
 
+    final_acc = opt_acc
+    final_prec = opt_prec
+    final_rec = opt_rec
+    final_f1 = opt_f1
+    final_auc = opt_auc
+    final_asa = opt_asa
+    final_far = opt_far
+    best_thresh = optimal_thresh
+
+    # 1. 补算测试集的 F1_Weighted
+    try:
+        final_f1_weighted = float(f1_score(final_labels, final_preds, average="weighted", zero_division=0))
+    except Exception:
+        final_f1_weighted = 0.0
+
+    # 2. 写入包含 8 大核心指标的终极 CSV
     log_file = "experiment_results.csv"
     file_exists = os.path.isfile(log_file)
     with open(log_file, "a", encoding="utf-8") as f:
         if not file_exists:
-            f.write("Dataset,Group,SeqLen,Hidden,Heads,DropEdge,Threshold,F1,ASA,FAR,AUC\n")
+            # 统一为论文要求的指标顺序
+            f.write("Dataset,Group,SeqLen,Threshold,ACC,PRE,REC,F1_Macro,F1_Weighted,AUC,ASA,FAR\n")
+
+        # 注意：下面的 DATASET_NAME 请根据脚本自行改为 NB15, Darknet2020 或 IDS2017
+        DATASET_NAME = "Darknet2020"
         f.write(
-            f"Darknet2020,{group_tag},{seq_len},{hidden},{heads},{dropedge_p},{optimal_thresh:.6f},"
-            f"{opt_f1:.4f},{opt_asa:.4f},{opt_far:.4f},{opt_auc:.4f}\n"
+            f"{DATASET_NAME},{group_tag},{seq_len},{best_thresh:.6f},"
+            f"{final_acc:.4f},{final_prec:.4f},{final_rec:.4f},"
+            f"{final_f1:.4f},{final_f1_weighted:.4f},{final_auc:.4f},"
+            f"{final_asa:.4f},{final_far:.4f}\n"
         )
 
     labels_idx = list(range(len(class_names)))

@@ -696,14 +696,23 @@ def run_one_experiment(group, h, train_seq, val_seq, test_seq, edge_dim, device)
     )
     print(f"[{group_tag}] Confusion Matrix Saved.", flush=True)
 
+    # 1. 补算测试集的 F1_Weighted
+    try:
+        final_f1_weighted = float(f1_score(y_true, y_pred, average="weighted", zero_division=0))
+    except Exception:
+        final_f1_weighted = 0.0
+
+    # 2. 写入包含 8 大核心指标的终极 CSV
     log_file = "experiment_results.csv"
     file_exists = os.path.isfile(log_file)
     with open(log_file, "a", encoding="utf-8") as f:
         if not file_exists:
-            f.write("Dataset,Group,SeqLen,Hidden,Heads,DropEdge,Threshold,F1,ASA,FAR,AUC\n")
+            f.write("Dataset,Group,SeqLen,Threshold,ACC,PRE,REC,F1_Macro,F1_Weighted,AUC,ASA,FAR\n")
         f.write(
-            f"ISCX2012,{group_tag},{seq_len},{hidden},{heads},{dropedge_p},{best_thresh:.6f},"
-            f"{f1:.4f},{asa:.4f},{far:.4f},{auc:.4f}\n"
+            f"ISCX2012,{group_tag},{seq_len},{best_thresh:.6f},"
+            f"{acc:.4f},{prec:.4f},{rec:.4f},"
+            f"{f1:.4f},{final_f1_weighted:.4f},{auc:.4f},"
+            f"{asa:.4f},{far:.4f}\n"
         )
     print(f"[{group_tag}] Total Time: {time.time() - start_time:.2f}s", flush=True)
 
