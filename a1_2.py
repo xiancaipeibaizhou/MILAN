@@ -15,6 +15,7 @@ import os
 import time
 import random
 import datetime
+import gc
 from tqdm import tqdm
 # from analys import FocalLoss
 from analys import (
@@ -747,18 +748,30 @@ def main():
 
     overall_start = time.time()
     for g in groups:
-        h = resolve_hparams(g, env=os.environ, dataset="nb15")
-        run_one_experiment(
-            g,
-            h,
-            train_seqs,
-            val_seqs,
-            test_seqs,
-            edge_dim,
-            class_names,
-            weights_cpu,
-            DEVICE,
-        )
+        try:
+            h = resolve_hparams(g, env=os.environ, dataset="nb15")
+            run_one_experiment(
+                g,
+                h,
+                train_seqs,
+                val_seqs,
+                test_seqs,
+                edge_dim,
+                class_names,
+                weights_cpu,
+                DEVICE,
+            )
+        except torch.OutOfMemoryError as e:
+            print(f"[{str(g).strip().upper() or 'CUSTOM'}] CUDA OOM, skip this group. Error: {e}", flush=True)
+        except RuntimeError as e:
+            if "CUDA out of memory" in str(e):
+                print(f"[{str(g).strip().upper() or 'CUSTOM'}] CUDA OOM, skip this group. Error: {e}", flush=True)
+            else:
+                raise
+        finally:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
 
     print(f"\nAll Experiments Done. Total Time: {time.time() - overall_start:.2f}s", flush=True)
 

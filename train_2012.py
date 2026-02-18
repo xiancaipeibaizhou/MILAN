@@ -9,6 +9,7 @@ import random
 import re
 import hashlib
 import datetime
+import gc
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -465,6 +466,17 @@ def _compute_sqrt_class_weights_from_graphs(graph_seq, num_classes):
     weights = weights / weights.sum() * num_classes
     return torch.tensor(weights, dtype=torch.float)
 
+def _edge_label_counts_from_graphs(graph_seq, num_classes):
+    counts = np.zeros(num_classes, dtype=np.int64)
+    for g in graph_seq:
+        if g is None:
+            continue
+        labels = g.edge_labels.detach().cpu().numpy().astype(np.int64)
+        if labels.size == 0:
+            continue
+        counts += np.bincount(labels, minlength=num_classes).astype(np.int64)
+    return counts
+
 def run_one_experiment(group, h, train_seq, val_seq, test_seq, edge_dim, device):
     group = (group or "").strip().upper()
     group_tag = group if group else "CUSTOM"
@@ -657,19 +669,33 @@ def run_one_experiment(group, h, train_seq, val_seq, test_seq, edge_dim, device)
                 val_steps += 1
 
         avg_val_loss = total_val_loss / max(1, val_steps)
-        val_acc, val_prec, val_rec, val_f1, val_far, val_auc, val_asa = evaluate_comprehensive(
+        val_acc, val_prec, val_rec, val_f1_weighted, val_far, val_auc, val_asa = evaluate_comprehensive(
             model, val_loader, device, class_names
         )
 
+        _, _, _, _, _, _, _, y_true_val, y_pred_val = evaluate_comprehensive_with_threshold(
+            model, val_loader, device, class_names, threshold=1.1
+        )
+        try:
+            val_f1_macro = float(f1_score(y_true_val, y_pred_val, average="macro", zero_division=0))
+        except Exception:
+            val_f1_macro = 0.0
+        try:
+            val_f1_attack = float(f1_score(y_true_val, y_pred_val, average="binary", pos_label=1, zero_division=0))
+        except Exception:
+            val_f1_attack = 0.0
         current_lr = optimizer.param_groups[0]["lr"]
         print(
             f"[{group_tag}] Epoch {epoch+1} | Loss: {avg_loss:.4f} | Val Loss: {avg_val_loss:.4f} | "
-            f"Val F1: {val_f1:.4f} | ASA: {val_asa:.4f} | CL Loss: {avg_cl_loss:.4f} | LR: {current_lr:.6f}",
+            f"Val F1(macro): {val_f1_macro:.4f} | Val F1(weighted): {val_f1_weighted:.4f} | "
+            f"Val F1(attack): {val_f1_attack:.4f} | ASA: {val_asa:.4f} | CL Loss: {avg_cl_loss:.4f} | "
+            f"LR: {current_lr:.6f}",
             flush=True,
         )
 
-        metric_value = val_f1 if early_stop_metric == "val_f1" else val_asa
+        metric_value = val_f1_macro if early_stop_metric == "val_f1" else val_asa
         metric_display = "Val F1" if early_stop_metric == "val_f1" else "Val ASA"
+
 
         if metric_value > best_metric + min_delta:
             best_metric = metric_value
@@ -782,6 +808,46 @@ def main():
     test_seq = _build_graph_seq(test_df)
 
     print(f"Graph Count -> Train={len(train_seq)}, Val={len(val_seq)}, Test={len(test_seq)}", flush=True)
+    train_counts = _edge_label_counts_from_graphs(train_seq, num_classes=2)
+    val_counts = _edge_label_counts_from_graphs(val_seq, num_classes=2)
+    test_counts = _edge_label_counts_from_graphs(test_seq, num_classes=2)
+    print(f"Edge Label Count -> Train Normal={int(train_counts[0])} Attack={int(train_counts[1])}", flush=True)
+    print(f"Edge Label Count -> Val   Normal={int(val_counts[0])} Attack={int(val_counts[1])}", flush=True)
+    print(f"Edge Label Count -> Test  Normal={int(test_counts[0])} Attack={int(test_counts[1])}", flush=True)
+
+    min_val_attack_edges = int(os.getenv("MIN_VAL_ATTACK_EDGES", "50"))
+    if int(val_counts[1]) < int(min_val_attack_edges):
+        combined = list(train_seq) + list(val_seq)
+        n = len(combined)
+        if n >= 2:
+            start = max(1, int(n * 0.9))
+            chosen_start = start
+            best_candidate = None
+            best_candidate_attack = -1
+            while chosen_start > 1:
+                candidate = combined[chosen_start:]
+                c = _edge_label_counts_from_graphs(candidate, num_classes=2)
+                cand_attack = int(c[1])
+                if cand_attack > best_candidate_attack:
+                    best_candidate_attack = cand_attack
+                    best_candidate = chosen_start
+                if cand_attack >= int(min_val_attack_edges):
+                    break
+                step = max(1, int(n * 0.05))
+                chosen_start = max(1, chosen_start - step)
+            if best_candidate is not None:
+                chosen_start = best_candidate
+            train_seq = combined[:chosen_start]
+            val_seq = combined[chosen_start:]
+            train_counts = _edge_label_counts_from_graphs(train_seq, num_classes=2)
+            val_counts = _edge_label_counts_from_graphs(val_seq, num_classes=2)
+            print(
+                f"⚠️ Val split has too few Attack edges (<{int(min_val_attack_edges)}); fallback to split from Train+Val sequence.",
+                flush=True,
+            )
+            print(f"Graph Count (fallback) -> Train={len(train_seq)}, Val={len(val_seq)}", flush=True)
+            print(f"Edge Label Count (fallback) -> Train Normal={int(train_counts[0])} Attack={int(train_counts[1])}", flush=True)
+            print(f"Edge Label Count (fallback) -> Val   Normal={int(val_counts[0])} Attack={int(val_counts[1])}", flush=True)
 
     if len(train_seq) > 0:
         edge_dim = int(train_seq[0].edge_attr.shape[1])
@@ -805,8 +871,20 @@ def main():
 
     overall_start = time.time()
     for g in groups:
-        h = resolve_hparams(g, env=os.environ, dataset="iscx2012")
-        run_one_experiment(g, h, train_seq, val_seq, test_seq, edge_dim, device)
+        try:
+            h = resolve_hparams(g, env=os.environ, dataset="iscx2012")
+            run_one_experiment(g, h, train_seq, val_seq, test_seq, edge_dim, device)
+        except torch.OutOfMemoryError as e:
+            print(f"[{str(g).strip().upper() or 'CUSTOM'}] CUDA OOM, skip this group. Error: {e}", flush=True)
+        except RuntimeError as e:
+            if "CUDA out of memory" in str(e):
+                print(f"[{str(g).strip().upper() or 'CUSTOM'}] CUDA OOM, skip this group. Error: {e}", flush=True)
+            else:
+                raise
+        finally:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
 
     print(f"\nAll Experiments Done. Total Time: {time.time() - overall_start:.2f}s", flush=True)
 
@@ -814,3 +892,15 @@ if __name__ == "__main__":
     main()
 
 # HP_GROUPS=D6 python train_2012.py
+# 运行指令
+# cd /root/project/reon
+# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+# MIN_VAL_ATTACK_EDGES=50 \
+# HP_GROUPS=IS_EXP1_BASE,IS_EXP2_TINY,IS_EXP3_REG,IS_EXP4_NOCL \
+# python MILAN/train_2012.py
+# cd /root/project/reon
+# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+# HP_GROUPS=NB_EXP5_LONGSEQ \
+# python MILAN/a1_2.py
+# 看进度
+# tail -f logs_all_abl.txt
