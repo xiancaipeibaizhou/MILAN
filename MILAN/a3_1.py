@@ -909,17 +909,26 @@ if __name__ == "__main__":
 # HP_GROUPS=DK_EXP1_BASE,DK_EXP2_DRIFT1,DK_EXP3_DRIFT2,DK_EXP4_NOEDGE \
 # python -u MILAN/a2_4.py > logs_2020.txt 2>&1
 
-# NUM_WORKERS=8
 # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+# NUM_WORKERS=0
+# BATCH_SIZE=256
 # HP_GROUPS=IDS_EXP1_BASE,IDS_EXP2_MAXCL,IDS_EXP3_SMALLH,IDS_EXP4_NOCL,IDS_EXP5_DROP \
 # python -u MILAN/a3_1.py > logs_2017.txt 2>&1
 
 # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+# NUM_WORKERS=0
+# BATCH_SIZE=256
 # HP_GROUPS=NB_EXP1_BASE,NB_EXP2_LONGK,NB_EXP3_STRONG,NB_EXP4_NOATT,NB_EXP5_LONGSEQ \
 # python -u MILAN/a1_2.py > logs_nb15.txt 2>&1
 
+
 # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+# NUM_WORKERS=0
+# BATCH_SIZE=256
 # MIN_VAL_ATTACK_EDGES=50 \
 # HP_GROUPS=IS_EXP1_BASE,IS_EXP2_TINY,IS_EXP3_REG,IS_EXP4_NOCL \
 # python -u MILAN/train_2012.py > logs_2012.txt 2>&1
+
+# tail -f logs_2017.txt
+# tail -f logs_nb15.txt
 
