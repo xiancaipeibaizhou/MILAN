@@ -256,10 +256,23 @@ def _attack_metrics_from_scores(y_true_attack, y_score, threshold):
     tn, fp, fn, tp = confusion_matrix(y_true_attack, y_pred_attack, labels=[0, 1]).ravel()
     far = fp / (fp + tn) if (fp + tn) > 0 else 0.0
     asa = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1 = f1_score(y_true_attack, y_pred_attack, zero_division=0) if y_true_attack.size > 0 else 0.0
-    return float(f1), float(far), float(asa)
+    prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    return float(prec), float(rec), float(far), float(asa)
 
-def _attack_best_threshold(y_true_attack, y_score, max_far=0.01):
+def _fbeta_from_prec_rec(prec, rec, beta=2.0):
+    beta = float(beta)
+    prec = float(prec)
+    rec = float(rec)
+    if prec <= 0.0 or rec <= 0.0:
+        return 0.0
+    b2 = beta * beta
+    denom = (b2 * prec) + rec
+    if denom <= 0.0:
+        return 0.0
+    return (1.0 + b2) * prec * rec / denom
+
+def _attack_best_threshold(y_true_attack, y_score, max_far=0.01, beta=2.0):
     y_true_attack = np.asarray(y_true_attack, dtype=np.int64)
     y_score = np.asarray(y_score, dtype=np.float64)
     if y_true_attack.size == 0:
@@ -267,27 +280,29 @@ def _attack_best_threshold(y_true_attack, y_score, max_far=0.01):
     candidates = np.unique(np.quantile(y_score, np.linspace(0.0, 1.0, 101)))
 
     best_th = 0.5
-    best_f1 = -1.0
+    best_fbeta = -1.0
     best_far = 1.0
     best_asa = -1.0
     best_score = -1.0
     for th in candidates:
-        f1, far, asa = _attack_metrics_from_scores(y_true_attack, y_score, float(th))
+        prec, rec, far, asa = _attack_metrics_from_scores(y_true_attack, y_score, float(th))
+        fbeta = _fbeta_from_prec_rec(prec, rec, beta=beta)
         if far <= float(max_far):
-            current_score = float(f1) + float(asa)
+            current_score = float(fbeta)
             if (current_score > best_score) or (current_score == best_score and float(far) < float(best_far)):
-                best_th, best_f1, best_far, best_asa = float(th), float(f1), float(far), float(asa)
+                best_th, best_fbeta, best_far, best_asa = float(th), float(fbeta), float(far), float(asa)
                 best_score = float(current_score)
 
     if best_score < 0.0:
         for th in candidates:
-            f1, far, asa = _attack_metrics_from_scores(y_true_attack, y_score, float(th))
-            current_score = float(f1) + float(asa)
+            prec, rec, far, asa = _attack_metrics_from_scores(y_true_attack, y_score, float(th))
+            fbeta = _fbeta_from_prec_rec(prec, rec, beta=beta)
+            current_score = float(fbeta)
             if (current_score > best_score) or (current_score == best_score and float(far) < float(best_far)):
-                best_th, best_f1, best_far, best_asa = float(th), float(f1), float(far), float(asa)
+                best_th, best_fbeta, best_far, best_asa = float(th), float(fbeta), float(far), float(asa)
                 best_score = float(current_score)
 
-    return best_th, best_f1, best_far, best_asa
+    return best_th, best_fbeta, best_far, best_asa
 
 def evaluate_comprehensive_with_threshold(
     model, dataloader, device, class_names, threshold, average="macro"

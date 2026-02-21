@@ -281,7 +281,7 @@ def run_one_experiment(
     cosine_t0 = max(1, int(h.get("COSINE_T0", 10)))
     cosine_tmult = max(1, int(h.get("COSINE_TMULT", 1)))
     eta_min_ratio = float(h.get("ETA_MIN_RATIO", 0.01))
-    target_far = float(h.get("TARGET_FAR", 0.03))
+    target_far = float(h.get("TARGET_FAR", 0.005))
 
     if len(base_train_seqs) < seq_len or len(base_val_seqs) < 1 or len(base_test_seqs) < 1:
         print(
@@ -517,9 +517,9 @@ def run_one_experiment(
 
     print(f"\n[{group_tag}] === Post-Training Threshold Optimization ===", flush=True)
     y_true_val, y_score_val = _collect_attack_scores(model, val_loader, device, class_names)
-    best_thresh, val_f1, val_far, val_asa = _attack_best_threshold(y_true_val, y_score_val, max_far=target_far)
+    best_thresh, val_f2, val_far, val_asa = _attack_best_threshold(y_true_val, y_score_val, max_far=target_far)
     print(
-        f"[{group_tag}] Best Threshold found on VAL -> th={best_thresh:.4f}, Val F1={val_f1:.4f}, Val FAR={val_far:.4f}, Val ASA={val_asa:.4f}",
+        f"[{group_tag}] Best Threshold found on VAL -> th={best_thresh:.4f}, Val F2={val_f2:.4f}, Val FAR={val_far:.4f}, Val ASA={val_asa:.4f}",
         flush=True,
     )
 
@@ -535,7 +535,7 @@ def run_one_experiment(
         final_far,
         final_labels,
         final_preds,
-    ) = evaluate_comprehensive_with_threshold_v2(model, test_loader, device, class_names, threshold=best_thresh, average="macro")
+    ) = evaluate_comprehensive_with_threshold_v2(model, test_loader, device, class_names, threshold=best_thresh, average="weighted")
     final_f1 = final_f1_macro
 
     present = np.unique(np.asarray(final_labels, dtype=np.int64))
@@ -588,20 +588,42 @@ def run_one_experiment(
         cm_pct = np.divide(cm, row_sums, out=np.zeros_like(cm), where=row_sums != 0) * 100.0
 
         import seaborn as sns
+        
+        plt.figure(figsize=(12, 10)) # 保持稍大的画布
+        
+        # === 动态文本矩阵 ===
+        annot = np.empty_like(cm_pct, dtype=object)
+        for i in range(cm.shape[0]):
+            for j in range(cm.shape[1]):
+                if cm[i, j] == 0:
+                    annot[i, j] = "0"  # 核心改动：0值只保留一个0
+                else:
+                    annot[i, j] = f"{int(cm[i, j])}\n({cm_pct[i, j]:.1f}%)"
 
-        plt.figure(figsize=(10, 8))
-        sns.heatmap(
+        ax = sns.heatmap(
             cm_pct,
-            annot=True,
-            fmt=".1f",
+            annot=annot,
+            fmt="",
             cmap="Blues",
             xticklabels=class_names,
             yticklabels=class_names,
+            vmin=0.0,
+            vmax=100.0,
+            linewidths=0.5,           # 保留细微的白色网格线
+            annot_kws={"size": 9}     # 字体大小适中
         )
-        plt.title(f"{group_tag} Confusion Matrix (Threshold={best_thresh})")
+        
+        plt.xticks(rotation=45, ha='right', fontsize=10) 
+        plt.yticks(rotation=0, fontsize=10)
+        
+        plt.title(f"{group_tag} Confusion Matrix (Threshold={best_thresh:.4f})", fontsize=14, pad=15)
+        plt.ylabel('True Label', fontsize=12)
+        plt.xlabel('Predicted Label', fontsize=12)
+        
         plt.tight_layout()
-        plt.savefig(f"png/ids2017_full/FINAL_CM_{run_tag}.png", dpi=300)
-        print(f"[{group_tag}] Confusion Matrix Saved.", flush=True)
+        plt.savefig(f"png/ids2017_full/FINAL_CM_{run_tag}.png", dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"[{group_tag}] Confusion Matrix Saved (Optimized UI).", flush=True)
     except Exception as e:
         print(f"[{group_tag}] Plotting failed: {e}", flush=True)
 
@@ -926,9 +948,8 @@ if __name__ == "__main__":
 # NUM_WORKERS=0
 # BATCH_SIZE=256
 # MIN_VAL_ATTACK_EDGES=50 \
-# HP_GROUPS=IS_EXP1_BASE,IS_EXP2_TINY,IS_EXP3_REG,IS_EXP4_NOCL \
+# HP_GROUPS=IS_EXP1_BASE \
 # python -u MILAN/train_2012.py > logs_2012.txt 2>&1
 
 # tail -f logs_2017.txt
 # tail -f logs_nb15.txt
-

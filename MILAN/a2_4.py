@@ -280,7 +280,7 @@ def run_one_experiment(
     cosine_t0 = max(1, int(h.get("COSINE_T0", 10)))
     cosine_tmult = max(1, int(h.get("COSINE_TMULT", 1)))
     eta_min_ratio = float(h.get("ETA_MIN_RATIO", 0.01))
-    target_far = float(h.get("TARGET_FAR", 0.01))
+    target_far = float(h.get("TARGET_FAR", 0.005))
 
     if len(base_train_seqs) < seq_len or len(base_val_seqs) < 1 or len(base_test_seqs) < 1:
         print(
@@ -547,9 +547,9 @@ def run_one_experiment(
 
     print(f"\n[{group_tag}] === Post-Training Threshold Optimization ===", flush=True)
     y_true_val, y_score_val = _collect_attack_scores(model, val_loader, device, class_names)
-    optimal_thresh, val_f1, val_far, val_asa = _attack_best_threshold(y_true_val, y_score_val, max_far=target_far)
+    optimal_thresh, val_f2, val_far, val_asa = _attack_best_threshold(y_true_val, y_score_val, max_far=target_far)
     print(
-        f"[{group_tag}] Best Threshold found on VAL -> th={optimal_thresh:.4f}, Val F1={val_f1:.4f}, Val FAR={val_far:.4f}, Val ASA={val_asa:.4f}",
+        f"[{group_tag}] Best Threshold found on VAL -> th={optimal_thresh:.4f}, Val F2={val_f2:.4f}, Val FAR={val_far:.4f}, Val ASA={val_asa:.4f}",
         flush=True,
     )
 
@@ -565,7 +565,7 @@ def run_one_experiment(
         opt_far,
         final_labels,
         final_preds,
-    ) = evaluate_comprehensive_with_threshold_v2(model, test_loader, device, class_names, threshold=optimal_thresh, average="macro")
+    ) = evaluate_comprehensive_with_threshold_v2(model, test_loader, device, class_names, threshold=optimal_thresh, average="weighted")
     opt_f1 = opt_f1_macro
     present = np.unique(np.asarray(final_labels, dtype=np.int64))
     missing = sorted(list(set(range(len(class_names))) - set(present.tolist())))

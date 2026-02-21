@@ -419,7 +419,7 @@ def run_one_experiment(group, h, train_seq, val_seq, test_seq, edge_dim, device)
     cosine_t0 = max(1, int(h.get("COSINE_T0", 10)))
     cosine_tmult = max(1, int(h.get("COSINE_TMULT", 1)))
     eta_min_ratio = float(h.get("ETA_MIN_RATIO", 0.01))
-    target_far = float(h.get("TARGET_FAR", 0.03))
+    target_far = float(h.get("TARGET_FAR", 0.005))
 
     if len(train_seq) < seq_len or len(val_seq) < 1 or len(test_seq) < 1:
         print(
@@ -660,9 +660,9 @@ def run_one_experiment(group, h, train_seq, val_seq, test_seq, edge_dim, device)
 
     print(f"\n[{group_tag}] === Post-Training Threshold Optimization ===", flush=True)
     y_true_val, y_score_val = _collect_attack_scores(model, val_loader, device, class_names)
-    best_thresh, val_f1, val_far, val_asa = _attack_best_threshold(y_true_val, y_score_val, max_far=target_far)
+    best_thresh, val_f2, val_far, val_asa = _attack_best_threshold(y_true_val, y_score_val, max_far=target_far)
     print(
-        f"[{group_tag}] Best Threshold found on VAL -> th={best_thresh:.4f}, Val F1={val_f1:.4f}, Val FAR={val_far:.4f}, Val ASA={val_asa:.4f}",
+        f"[{group_tag}] Best Threshold found on VAL -> th={best_thresh:.4f}, Val F2={val_f2:.4f}, Val FAR={val_far:.4f}, Val ASA={val_asa:.4f}",
         flush=True,
     )
 
@@ -678,7 +678,7 @@ def run_one_experiment(group, h, train_seq, val_seq, test_seq, edge_dim, device)
         far,
         y_true,
         y_pred,
-    ) = evaluate_comprehensive_with_threshold_v2(model, test_loader, device, class_names, threshold=best_thresh, average="macro")
+    ) = evaluate_comprehensive_with_threshold_v2(model, test_loader, device, class_names, threshold=best_thresh, average="weighted")
     f1 = f1_macro
     print(
         f"[{group_tag}] Final Test -> ACC: {acc:.4f}, PREC: {prec:.4f}, Rec: {rec:.4f}, "
