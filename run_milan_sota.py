@@ -17,7 +17,6 @@ from torch_geometric.loader import DataLoader
 from torch_geometric.data import Batch
 from datetime import datetime
 from tqdm import tqdm
-
 # 导入超参解析和你的模型组
 from hparams_a3 import resolve_hparams
 from model import MILAN
@@ -47,96 +46,120 @@ def temporal_collate_fn(batch):
         batched_seq.append(Batch.from_data_list(graphs_at_t))
     return batched_seq
 
+def get_normal_indices(class_names):
+    """智能识别所有属于正常的类别索引 (兼容 Darknet2020 的 Non-Tor/NonVPN)"""
+    if class_names is None: return [0]
+    normals = []
+    for idx, name in enumerate(class_names):
+        name_lower = str(name).lower().replace('-', '').replace('_', '').replace(' ', '')
+        if any(k in name_lower for k in ['benign', 'normal', 'nonvpn', 'nontor']):
+            normals.append(idx)
+    # 如果找不到，保底返回 0
+    return normals if len(normals) > 0 else [0]
 # ==========================================
 # 2. 动态 F2 阈值与统一评估模块
 # ==========================================
-def find_best_f2_threshold_and_predict(y_true_val, y_prob_val, y_prob_test, normal_idx=0, target_far=0.005):
-    """验证集搜寻 F2 最佳阈值，并应用到测试集"""
-    y_true_val_bin = (y_true_val != normal_idx).astype(int)
-    attack_probs_val = 1.0 - y_prob_val[:, normal_idx]
+def find_best_macro_f1_threshold_and_predict(y_true_val, y_prob_val, y_prob_test, normal_indices):
+    """多正常类兼容版的 Macro F1 阈值搜寻"""
+    # 攻击概率 = 1 - 所有正常类概率之和
+    normal_probs_val = np.sum(y_prob_val[:, normal_indices], axis=1)
+    attack_probs_val = 1.0 - normal_probs_val
+    y_true_val_bin = (~np.isin(y_true_val, normal_indices)).astype(int)
     
-    best_th = 0.5
-    best_f2 = -1.0
+    candidates = np.unique(np.quantile(attack_probs_val, np.linspace(0.0, 1.0, 101)))
+    best_th, best_macro_f1, best_far = 0.5, -1.0, 1.0
     
-    # 扫描搜寻最佳阈值
-    for th in np.arange(0.01, 0.99, 0.01):
-        y_pred_val_bin = (attack_probs_val >= th).astype(int)
+    for th in candidates:
+        y_pred_val_sim = np.argmax(y_prob_val, axis=-1)
         
-        # FAR 限制逻辑 (可选，借鉴你原代码的 target_far 思想)
+        # 1. 攻击概率低于阈值，强判为概率最大的那个正常类
+        best_normal_class_val = np.array(normal_indices)[np.argmax(y_prob_val[:, normal_indices], axis=1)]
+        y_pred_val_sim[attack_probs_val < th] = best_normal_class_val[attack_probs_val < th]
+        
+        # 2. 攻击概率高于阈值，但原本预测为正常的，强判为概率最大的攻击类
+        mask = (attack_probs_val >= th) & np.isin(y_pred_val_sim, normal_indices)
+        if mask.any():
+            probs_copy = y_prob_val.copy()
+            probs_copy[:, normal_indices] = -1.0  # 将正常类概率降维打击
+            y_pred_val_sim[mask] = np.argmax(probs_copy[mask], axis=-1)
+            
+        y_pred_val_bin = (~np.isin(y_pred_val_sim, normal_indices)).astype(int)
         fp = np.logical_and(y_true_val_bin == 0, y_pred_val_bin == 1).sum()
         tn = np.logical_and(y_true_val_bin == 0, y_pred_val_bin == 0).sum()
         far = fp / (fp + tn) if (fp + tn) > 0 else 0.0
         
-        if far <= target_far * 2.0: # 允许一定容差
-            f2 = fbeta_score(y_true_val_bin, y_pred_val_bin, beta=2.0, zero_division=0)
-            if f2 > best_f2:
-                best_f2 = f2
-                best_th = th
-                
-    print(f"  -> 🔍 Dynamic Threshold via F2: {best_th:.2f} (Val F2: {best_f2:.4f})")
-    
+        macro_f1 = f1_score(y_true_val, y_pred_val_sim, average='macro', zero_division=0)
+        
+        if macro_f1 > best_macro_f1 or (macro_f1 == best_macro_f1 and far < best_far):
+            best_macro_f1, best_th, best_far = macro_f1, th, far
+
     # 应用到测试集
     test_preds = np.argmax(y_prob_test, axis=-1)
-    attack_probs_test = 1.0 - y_prob_test[:, normal_idx]
+    normal_probs_test = np.sum(y_prob_test[:, normal_indices], axis=1)
+    attack_probs_test = 1.0 - normal_probs_test
     
-    # 低于阈值强判为正常
-    test_preds[attack_probs_test < best_th] = normal_idx
-    # 高于阈值但原本预测为正常的，强判为概率最大的攻击类
-    mask_to_attack = (attack_probs_test >= best_th) & (test_preds == normal_idx)
+    best_normal_class_test = np.array(normal_indices)[np.argmax(y_prob_test[:, normal_indices], axis=1)]
+    test_preds[attack_probs_test < best_th] = best_normal_class_test[attack_probs_test < best_th]
+    
+    mask_to_attack = (attack_probs_test >= best_th) & np.isin(test_preds, normal_indices)
     if mask_to_attack.any():
         probs_copy = y_prob_test.copy()
-        probs_copy[:, normal_idx] = -1.0 
+        probs_copy[:, normal_indices] = -1.0 
         test_preds[mask_to_attack] = np.argmax(probs_copy[mask_to_attack], axis=-1)
         
-    return test_preds, best_th
+    return test_preds, best_th, best_macro_f1, best_far
 
-def compute_all_metrics(y_true, y_pred, y_prob=None, class_names=None, variant_name="MILAN"):
+def compute_all_metrics(y_true, y_pred, y_prob=None, class_names=None, normal_indices=None):
     metrics = {}
     metrics['ACC'] = accuracy_score(y_true, y_pred)
-    metrics['Precision (Weighted)'] = precision_score(y_true, y_pred, average='weighted', zero_division=0)
-    metrics['Recall (Weighted)'] = recall_score(y_true, y_pred, average='weighted', zero_division=0)
+    metrics['APR'] = precision_score(y_true, y_pred, average='weighted', zero_division=0)
+    metrics['RE'] = recall_score(y_true, y_pred, average='weighted', zero_division=0)
     metrics['F1 (Weighted)'] = f1_score(y_true, y_pred, average='weighted', zero_division=0)
     metrics['F1 (Macro)'] = f1_score(y_true, y_pred, average='macro', zero_division=0)
     
-    if y_prob is not None:
-        try: metrics['AUC'] = roc_auc_score(y_true, y_prob, multi_class='ovr', average='macro')
-        except: metrics['AUC'] = float('nan')
-    else: metrics['AUC'] = float('nan')
+    # ---------------- 安全版 AUC 计算 ----------------
+    if y_prob is not None and y_prob.ndim == 2:
+        present_classes = np.unique(y_true)
+        if len(present_classes) < 2:
+            metrics['AUC'] = float('nan')
+        elif len(present_classes) == 2:
+            pos_class = present_classes[1]
+            y_true_bin = (y_true == pos_class).astype(int)
+            try: metrics['AUC'] = roc_auc_score(y_true_bin, y_prob[:, pos_class])
+            except: metrics['AUC'] = float('nan')
+        else:
+            aucs = []
+            for c in present_classes:
+                y_true_bin = (y_true == c).astype(int)
+                if len(np.unique(y_true_bin)) == 2:
+                    try: aucs.append(roc_auc_score(y_true_bin, y_prob[:, c]))
+                    except: pass
+            metrics['AUC'] = np.mean(aucs) if len(aucs) > 0 else float('nan')
+    else: 
+        metrics['AUC'] = float('nan')
 
-    num_classes = len(class_names) if class_names else int(np.max(y_true)) + 1
+    # ---------------- 精准计算 FAR 和 ASA (支持多正常类) ----------------
+    num_classes = len(class_names) if class_names is not None else int(np.max(y_true)) + 1
     cm = confusion_matrix(y_true, y_pred, labels=np.arange(num_classes))
     
-    normal_idx = 0
-    if class_names is not None:
-        for idx, name in enumerate(class_names):
-            if any(k in str(name).lower() for k in ['benign', 'normal']):
-                normal_idx = idx
-                break
+    if normal_indices is None: normal_indices = [0]
+    
+    is_true_normal = np.isin(y_true, normal_indices)
+    is_pred_normal = np.isin(y_pred, normal_indices)
+    
+    # 误报：原本是正常类，被预测成了非正常类
+    fp = np.logical_and(is_true_normal, ~is_pred_normal).sum()
+    # 真阴：原本是正常类，预测也是正常类
+    tn = np.logical_and(is_true_normal, is_pred_normal).sum()
+    metrics['FAR'] = float(fp / (fp + tn)) if (fp + tn) > 0 else 0.0
+    
+    # 攻击拦截率：原本是非正常类
+    attack_mask = ~is_true_normal
+    attack_total = attack_mask.sum()
+    # 并且预测正确的非正常类 (必须是预测对了具体的攻击类别才算拦截成功)
+    attack_correct = np.logical_and(attack_mask, y_true == y_pred).sum()
+    metrics['ASA'] = float(attack_correct / attack_total) if attack_total > 0 else 0.0
 
-    if cm.shape[0] > 1:
-        mask = np.ones(cm.shape[0], dtype=bool)
-        mask[normal_idx] = False 
-        FP = cm[normal_idx, mask].sum()
-        TN = cm[normal_idx, normal_idx]
-        metrics['FAR'] = float(FP / (FP + TN)) if (FP + TN) > 0 else 0.0
-        
-        attack_total = cm[mask, :].sum()
-        attack_correct = cm.diagonal()[mask].sum()
-        metrics['ASA'] = float(attack_correct / attack_total) if attack_total > 0 else 0.0
-    else:
-        metrics['FAR'], metrics['ASA'] = 0.0, 0.0
-
-    print("\n" + "="*40)
-    print(f"--- 🏆 {variant_name} Final Test Results ---")
-    print(f"ACC:           {metrics['ACC']:.4f}")
-    print(f"APR (Prec):    {metrics['Precision (Weighted)']:.4f}")
-    print(f"RE  (Recall):  {metrics['Recall (Weighted)']:.4f}")
-    if not np.isnan(metrics['AUC']): print(f"AUC:           {metrics['AUC']:.4f}")
-    print(f"F1 (Weighted): {metrics['F1 (Weighted)']:.4f}")
-    print(f"F1 (Macro):    {metrics['F1 (Macro)']:.4f}")
-    print(f"FAR:           {metrics['FAR']:.4f}")
-    print(f"ASA:           {metrics['ASA']:.4f}")
-    print("="*40 + "\n")
     return metrics, cm
 
 def plot_and_save_confusion_matrix(cm, target_names, save_path):
@@ -357,24 +380,41 @@ def main():
     val_true, val_prob = get_eval_predictions(model, val_loader, device)
     test_true, test_prob = get_eval_predictions(model, test_loader, device)
     
-    test_pred_dynamic, best_th = find_best_f2_threshold_and_predict(val_true, val_prob, test_prob)
-    
-    metrics, cm = compute_all_metrics(test_true, test_pred_dynamic, test_prob, class_names, variant_name=args.variant)
+    # 1. 先获取该数据集的真实正常类索引
+    normal_indices = get_normal_indices(class_names)
+        
+    # 2. 把 normal_indices 传给这两个函数
+    test_pred, best_th, val_macro, val_far = find_best_macro_f1_threshold_and_predict(val_true, val_prob, test_prob, normal_indices)
+    metrics, cm = compute_all_metrics(test_true, test_pred, test_prob, class_names, normal_indices)
     plot_and_save_confusion_matrix(cm, class_names, os.path.join(save_dir, f"cm_thresh_{best_th:.2f}.png"))
     
-    # 写入结果记录
+    # ====================
+    # 结果写入与保存
+    # ====================
+    # 1. 保存当前实验的详细指标
     with open(os.path.join(save_dir, "metrics.txt"), "w") as f:
         f.write(f"=== {exp_name} (Thresh: {best_th:.2f}) ===\n")
-        for k, v in metrics.items(): f.write(f"{k}: {v:.4f}\n")
+        for k, v in metrics.items(): 
+            f.write(f"{k}: {v:.4f}\n")
             
-    # 全局 CSV 记录表 (可用于论文画表)
-    csv_file = "milan_ablations_results.csv"
+    # 2. 保存训练过程的 Loss 和 F1 变化 (用于画图)
+    with open(os.path.join(save_dir, "training_history.log"), "w") as f:
+        for log_line in training_log:
+            f.write(log_line + "\n")
+            
+    # 3. 追加写入全局 CSV 记录表 (可用于论文画表)
+    # ！！就是这里，必须先定义 csv_file 变量 ！！
+    csv_file = "milan_ablations_results.csv" 
+    
+    # 如果文件不存在，先写入表头
     if not os.path.isfile(csv_file):
         with open(csv_file, "w") as f:
-            f.write("Dataset,Variant,Group,Threshold,ACC,PRE,REC,F1_Macro,F1_Weighted,AUC,ASA,FAR\n")
+            f.write("Dataset,Variant,Group,Threshold,ACC,APR,RE,F1_Macro,F1_Weighted,AUC,ASA,FAR\n")
+            
+    # 追加写入当前实验的具体数值
     with open(csv_file, "a") as f:
         f.write(f"{args.dataset},{args.variant},{group_str},{best_th:.4f},"
-                f"{metrics['ACC']:.4f},{metrics['Precision (Weighted)']:.4f},{metrics['Recall (Weighted)']:.4f},"
+                f"{metrics['ACC']:.4f},{metrics['APR']:.4f},{metrics['RE']:.4f},"
                 f"{metrics['F1 (Macro)']:.4f},{metrics['F1 (Weighted)']:.4f},{metrics['AUC']:.4f},"
                 f"{metrics['ASA']:.4f},{metrics['FAR']:.4f}\n")
 

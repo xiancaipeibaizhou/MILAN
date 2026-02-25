@@ -10,7 +10,8 @@ from model import (
     DropPath,
     TemporalInception1D,
     LinearTemporalAttention,
-    EdgeUpdaterModule
+    EdgeUpdaterModule,
+    EntropyGatingUnit  # 已确保导入
 )
 
 # ==========================================
@@ -95,7 +96,6 @@ class BaseAblationMILAN(nn.Module):
             nn.GELU(), nn.Dropout(dropout), nn.Linear(hidden * 2, num_classes)
         )
 
-    # 抽取出的对齐逻辑，减少重复代码
     def _align_temporal_features(self, batch_global_ids, spatial_node_feats):
         all_ids = torch.cat(batch_global_ids)
         unique_ids, _ = torch.sort(torch.unique(all_ids))
@@ -154,7 +154,6 @@ from model import EdgeAugmentedAttention
 class MILAN_WoGlobal(BaseAblationMILAN):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Spatial 保持不变
         self.num_layers = 2
         self.spatial_layers = nn.ModuleList([
             nn.ModuleDict({
@@ -162,11 +161,11 @@ class MILAN_WoGlobal(BaseAblationMILAN):
                 'edge_upd': EdgeUpdaterModule(self.hidden, self.hidden, self.hidden, kwargs.get('dropout', 0.3))
             }) for _ in range(self.num_layers)
         ])
-        # Temporal: 仅保留 Local
         self.stream_local = TemporalInception1D(self.hidden, self.hidden, kernel_set=kwargs.get('kernels'))
 
     def forward(self, graphs):
         spatial_node_feats, spatial_edge_feats, active_edge_indices, batch_global_ids = [], [], [], []
+        edge_masks = []
         
         for t in range(self.seq_len):
             data = graphs[t]
@@ -175,6 +174,9 @@ class MILAN_WoGlobal(BaseAblationMILAN):
             if self.training and self.dropedge_p > 0.0:
                 edge_index, edge_mask = dropout_edge(edge_index, p=self.dropedge_p, force_undirected=False)
                 edge_attr = edge_attr[edge_mask]
+            else:
+                edge_mask = torch.ones(edge_index.size(1), dtype=torch.bool, device=edge_index.device)
+            edge_masks.append(edge_mask)
             
             for layer in self.spatial_layers:
                 x = layer["node_att"](x, edge_index, edge_attr, getattr(data, 'batch', None))
@@ -187,10 +189,10 @@ class MILAN_WoGlobal(BaseAblationMILAN):
 
         x_base, unique_ids = self._align_temporal_features(batch_global_ids, spatial_node_feats)
         
-        # 仅通过 Local Stream，无 Gating
         x_local_in = x_base.permute(0, 2, 1) 
-        dense_out = self.stream_local(x_local_in).permute(0, 2, 1) + x_base # 加残差
+        dense_out = self.stream_local(x_local_in).permute(0, 2, 1) + x_base 
         
+        self._last_edge_masks = edge_masks
         return self._readout_and_classify(dense_out, batch_global_ids, unique_ids, active_edge_indices, spatial_edge_feats)
 
 
@@ -207,11 +209,11 @@ class MILAN_WoLocal(BaseAblationMILAN):
                 'edge_upd': EdgeUpdaterModule(self.hidden, self.hidden, self.hidden, kwargs.get('dropout', 0.3))
             }) for _ in range(self.num_layers)
         ])
-        # Temporal: 仅保留 Global
         self.stream_global = LinearTemporalAttention(self.hidden, kwargs.get('heads', 8), kwargs.get('dropout', 0.3))
 
     def forward(self, graphs):
         spatial_node_feats, spatial_edge_feats, active_edge_indices, batch_global_ids = [], [], [], []
+        edge_masks = []
         
         for t in range(self.seq_len):
             data = graphs[t]
@@ -220,6 +222,9 @@ class MILAN_WoLocal(BaseAblationMILAN):
             if self.training and self.dropedge_p > 0.0:
                 edge_index, edge_mask = dropout_edge(edge_index, p=self.dropedge_p, force_undirected=False)
                 edge_attr = edge_attr[edge_mask]
+            else:
+                edge_mask = torch.ones(edge_index.size(1), dtype=torch.bool, device=edge_index.device)
+            edge_masks.append(edge_mask)
             
             for layer in self.spatial_layers:
                 x = layer["node_att"](x, edge_index, edge_attr, getattr(data, 'batch', None))
@@ -232,9 +237,9 @@ class MILAN_WoLocal(BaseAblationMILAN):
 
         x_base, unique_ids = self._align_temporal_features(batch_global_ids, spatial_node_feats)
         
-        # 仅通过 Global Stream，无 Gating
-        dense_out = self.stream_global(x_base) + x_base # 加残差
+        dense_out = self.stream_global(x_base) + x_base 
         
+        self._last_edge_masks = edge_masks
         return self._readout_and_classify(dense_out, batch_global_ids, unique_ids, active_edge_indices, spatial_edge_feats)
 
 
@@ -256,6 +261,7 @@ class MILAN_WoGating(BaseAblationMILAN):
 
     def forward(self, graphs):
         spatial_node_feats, spatial_edge_feats, active_edge_indices, batch_global_ids = [], [], [], []
+        edge_masks = []
         
         for t in range(self.seq_len):
             data = graphs[t]
@@ -264,6 +270,9 @@ class MILAN_WoGating(BaseAblationMILAN):
             if self.training and self.dropedge_p > 0.0:
                 edge_index, edge_mask = dropout_edge(edge_index, p=self.dropedge_p, force_undirected=False)
                 edge_attr = edge_attr[edge_mask]
+            else:
+                edge_mask = torch.ones(edge_index.size(1), dtype=torch.bool, device=edge_index.device)
+            edge_masks.append(edge_mask)
             
             for layer in self.spatial_layers:
                 x = layer["node_att"](x, edge_index, edge_attr, getattr(data, 'batch', None))
@@ -280,9 +289,9 @@ class MILAN_WoGating(BaseAblationMILAN):
         x_local = self.stream_local(x_local_in).permute(0, 2, 1)
         x_global = self.stream_global(x_base)
         
-        # 直接相加，代替门控
         dense_out = x_local + x_global + x_base 
         
+        self._last_edge_masks = edge_masks
         return self._readout_and_classify(dense_out, batch_global_ids, unique_ids, active_edge_indices, spatial_edge_feats)
 
 
@@ -294,7 +303,6 @@ class MILAN_WoEdgeAug(BaseAblationMILAN):
         super().__init__(*args, **kwargs)
         self.num_layers = 2
         
-        # 替换为普通的 Graph Attention，并在之后通过简单的 MLP 更新 Edge (由于不用作 attention，独立更新)
         self.spatial_layers = nn.ModuleList([
             nn.ModuleDict({
                 'node_att': NormalGraphAttention(self.hidden, self.hidden, kwargs.get('heads', 8), kwargs.get('dropout', 0.3), drop_path=kwargs.get('drop_path', 0.1)),
@@ -304,13 +312,11 @@ class MILAN_WoEdgeAug(BaseAblationMILAN):
         
         self.stream_local = TemporalInception1D(self.hidden, self.hidden, kernel_set=kwargs.get('kernels'))
         self.stream_global = LinearTemporalAttention(self.hidden, kwargs.get('heads', 8), kwargs.get('dropout', 0.3))
-        
-        # 从 model.py 导入门控单元
-        from model import EntropyGatingUnit
         self.gating = EntropyGatingUnit(self.hidden)
 
     def forward(self, graphs):
         spatial_node_feats, spatial_edge_feats, active_edge_indices, batch_global_ids = [], [], [], []
+        edge_masks = []
         
         for t in range(self.seq_len):
             data = graphs[t]
@@ -319,6 +325,9 @@ class MILAN_WoEdgeAug(BaseAblationMILAN):
             if self.training and self.dropedge_p > 0.0:
                 edge_index, edge_mask = dropout_edge(edge_index, p=self.dropedge_p, force_undirected=False)
                 edge_attr = edge_attr[edge_mask]
+            else:
+                edge_mask = torch.ones(edge_index.size(1), dtype=torch.bool, device=edge_index.device)
+            edge_masks.append(edge_mask)
             
             for layer in self.spatial_layers:
                 # 传入普通注意力，没有 edge_attr
@@ -339,16 +348,16 @@ class MILAN_WoEdgeAug(BaseAblationMILAN):
         
         dense_out, _ = self.gating(x_local, x_global, x_base)
         
+        self._last_edge_masks = edge_masks
         return self._readout_and_classify(dense_out, batch_global_ids, unique_ids, active_edge_indices, spatial_edge_feats)
 
-# 变体 5: 替换为 PyTorch 原生标准 Transformer (O(T^2) 复杂度)
-# 用于证明 Linear Attention 在效率和显存上的优越性
+# ==========================================
+# 变体 5: 替换为 PyTorch 原生标准 Transformer
 # ==========================================
 class MILAN_StandardTransformer(BaseAblationMILAN):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         
-        # 1. 保持 Spatial Phase 不变 (Edge-Augmented Attention)
         self.num_layers = 2
         self.spatial_layers = nn.ModuleList([
             nn.ModuleDict({
@@ -364,44 +373,38 @@ class MILAN_StandardTransformer(BaseAblationMILAN):
             }) for _ in range(self.num_layers)
         ])
         
-        # 2. 保持 Stream A (Local Inception) 不变
         self.stream_local = TemporalInception1D(
             self.hidden, self.hidden, kernel_set=kwargs.get('kernels')
         )
         
-        # 3. 【核心替换】Stream B: 使用 PyTorch 原生 Transformer (二次复杂度)
-        # 注意：必须设置 batch_first=True，以匹配我们代码中 [Batch, Seq_Len, Hidden] 的维度
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=self.hidden, 
             nhead=kwargs.get('heads', 8), 
-            dim_feedforward=self.hidden * 2,  # 前馈网络隐层维度
+            dim_feedforward=self.hidden * 2,  
             dropout=kwargs.get('dropout', 0.3),
             batch_first=True, 
             activation='gelu'
         )
-        # 包装成 Encoder (只用 1 层，以公平对比我们原本只有 1 层的 Linear Attention)
         self.stream_global = nn.TransformerEncoder(encoder_layer, num_layers=1)
-        
-        # 4. 保持门控机制不变
         self.gating = EntropyGatingUnit(self.hidden)
 
     def forward(self, graphs):
         spatial_node_feats, spatial_edge_feats, active_edge_indices, batch_global_ids = [], [], [], []
+        edge_masks = []
         
-        # --- Phase 1: 空间特征提取 (与原模型完全一致) ---
         for t in range(self.seq_len):
             data = graphs[t]
-            # 编码节点和边
             x = self.node_enc(torch.nan_to_num(data.x))
             edge_attr = self.edge_enc(torch.nan_to_num(data.edge_attr))
             edge_index = data.edge_index
             
-            # DropEdge 正则化
             if self.training and self.dropedge_p > 0.0:
                 edge_index, edge_mask = dropout_edge(edge_index, p=self.dropedge_p, force_undirected=False)
                 edge_attr = edge_attr[edge_mask]
+            else:
+                edge_mask = torch.ones(edge_index.size(1), dtype=torch.bool, device=edge_index.device)
+            edge_masks.append(edge_mask)
             
-            # 空间图卷积
             for layer in self.spatial_layers:
                 x = layer["node_att"](x, edge_index, edge_attr, getattr(data, 'batch', None))
                 edge_attr = layer["edge_upd"](x, edge_index, edge_attr)
@@ -410,7 +413,6 @@ class MILAN_StandardTransformer(BaseAblationMILAN):
             spatial_node_feats.append(x)
             spatial_edge_feats.append(edge_attr)
             
-            # 提取 global id 用于时序对齐
             if hasattr(data, "n_id"):
                 batch_global_ids.append(data.n_id)
             elif hasattr(data, "id"):
@@ -418,22 +420,15 @@ class MILAN_StandardTransformer(BaseAblationMILAN):
             else:
                 batch_global_ids.append(torch.arange(x.size(0), device=x.device))
 
-        # --- Phase 2: 调用 Base 类的方法进行时序特征对齐 ---
         x_base, unique_ids = self._align_temporal_features(batch_global_ids, spatial_node_feats)
         
-        # --- Phase 3: 双流处理 ---
-        # Stream A: Local Stream (Inception 需要 [Batch, Channel, Time])
         x_local_in = x_base.permute(0, 2, 1) 
         x_local = self.stream_local(x_local_in).permute(0, 2, 1)
-        
-        # Stream B: Global Stream (原生 TransformerEncoder)
-        # 输入维度: [Batch, Seq_Len, Hidden] (因为 batch_first=True)
         x_global = self.stream_global(x_base)
         
-        # 门控融合
         dense_out, _ = self.gating(x_local, x_global, x_base)
         
-        # --- Phase 4 & 5: 调用 Base 类的方法进行 Readout & 对比学习分类 ---
+        self._last_edge_masks = edge_masks
         return self._readout_and_classify(
             dense_out, batch_global_ids, unique_ids, active_edge_indices, spatial_edge_feats
         )
